@@ -2,6 +2,8 @@
 Associative Memories via Predictive Coding
 ============================================
 
+https://app.devin.ai/local/conversation-shares/lcs-64488af5c64c4263818c3232b26c881e
+
 Reproduces experiments from:
     Salvatori et al. (2021) "Associative Memories via Predictive Coding"
     arXiv:2109.08063
