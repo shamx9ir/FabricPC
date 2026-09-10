@@ -246,6 +246,42 @@ class PlannedMultiContrastResults:
             arm_a=arm_a, arm_b=arm_b, mean=mean, std=std, se=se, n=n
         )
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Flatten results into a plain dict compatible with the notebook print helpers.
+
+        Keys produced:
+        - ``{arm}_mean``, ``{arm}_se`` for every arm.
+        - ``{a}-{b}_delta``, ``{a}-{b}_pval``, ``{a}-{b}_sig``, ``{a}-{b}_d``
+          for every declared contrast.
+        - ``{a}-{b}_delta_descriptive``, ``{a}-{b}_se_descriptive`` for the
+          total gain (first arm vs last arm) when >= 3 arms and the pair is not
+          already a declared contrast.
+        """
+        out: Dict[str, Any] = {}
+        # Per-arm summary statistics
+        for name in self.arm_names:
+            vals = self.per_arm_metrics(name)
+            out[f"{name}_mean"] = float(np.mean(vals))
+            n = len(vals)
+            out[f"{name}_se"] = float(np.std(vals, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+        # Planned contrasts
+        for cr in self.contrast_results():
+            key = f"{cr.arm_a}-{cr.arm_b}"
+            out[f"{key}_delta"] = cr.mean_diff
+            out[f"{key}_pval"] = cr.p_value
+            out[f"{key}_sig"] = cr.significant_at_05
+            out[f"{key}_d"] = cr.cohens_d
+        # Descriptive total gain (first vs last arm) if not already a contrast
+        declared = {(a, b) for a, b in self.contrasts}
+        if len(self.arm_names) >= 3:
+            first, last = self.arm_names[0], self.arm_names[-1]
+            if (last, first) not in declared:
+                dd = self.delta(last, first)
+                desc_key = f"{last}-{first}"
+                out[f"{desc_key}_delta_descriptive"] = dd.mean
+                out[f"{desc_key}_se_descriptive"] = dd.se
+        return out
+
 
 class PlannedMultiContrastExperiment:
     """Runner for paired N-arm experiments with constructor-declared contrasts.
@@ -285,7 +321,7 @@ class PlannedMultiContrastExperiment:
 
     def __init__(
         self,
-        arms: List[ExperimentArm],
+        arms,
         contrasts: List[Tuple[str, str]],
         metric: str,
         data_loader_factory: DataLoaderFactory,
@@ -293,6 +329,10 @@ class PlannedMultiContrastExperiment:
         seed_offset: int = 0,
         verbose: bool = False,
     ):
+        # Accept either a list of ExperimentArm or a dict mapping name -> ExperimentArm
+        if isinstance(arms, dict):
+            arms = list(arms.values())
+
         if len(arms) < 1:
             raise ValueError("arms must contain at least one ExperimentArm.")
 

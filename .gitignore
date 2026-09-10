@@ -10,6 +10,7 @@ __pycache__/
 # Virtual environments
 .env
 .venv
+.venv-wsl/
 .env310/
 venv/
 env/
