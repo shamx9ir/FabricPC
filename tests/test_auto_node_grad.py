@@ -136,6 +136,7 @@ class TestLinearAutoGradNode:
             z_mu=jnp.zeros((batch_size, output_dim)),
             error=jnp.zeros((batch_size, output_dim)),
             energy=jnp.zeros((batch_size,)),
+            dual=jnp.zeros((batch_size, output_dim)),
         )
 
         # Compare forward_and_latent_grads results
@@ -242,6 +243,7 @@ class TestLinearAutoGradNode:
             z_mu=jnp.zeros((batch_size, output_dim)),
             error=jnp.zeros((batch_size, output_dim)),
             energy=jnp.zeros((batch_size,)),
+            dual=jnp.zeros((batch_size, output_dim)),
         )
 
         # Compare forward_and_weight_grads results

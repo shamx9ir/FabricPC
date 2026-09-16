@@ -151,6 +151,7 @@ class GlobalStateInit(StateInitBase):
                 error=jnp.zeros(shape),
                 energy=jnp.zeros((batch_size,)),
                 latent_grad=jnp.zeros(shape),
+                dual=jnp.zeros(shape),
             )
 
         state = GraphState(nodes=node_state_dict, batch_size=batch_size)
@@ -201,6 +202,7 @@ class NodeDistributionStateInit(StateInitBase):
                 error=jnp.zeros(shape),
                 energy=jnp.zeros((batch_size,)),
                 latent_grad=jnp.zeros(shape),
+                dual=jnp.zeros(shape),
             )
 
         state = GraphState(nodes=node_state_dict, batch_size=batch_size)
@@ -260,6 +262,7 @@ class FeedforwardStateInit(StateInitBase):
                 error=jnp.zeros(shape),
                 energy=jnp.zeros((batch_size,)),
                 latent_grad=jnp.zeros(shape),
+                dual=jnp.zeros(shape),
             )
 
         state = GraphState(nodes=node_state_dict, batch_size=batch_size)

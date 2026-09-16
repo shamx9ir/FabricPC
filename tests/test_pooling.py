@@ -211,6 +211,7 @@ class TestMaxPoolForward:
             error=jnp.zeros_like(z_latent),
             energy=jnp.zeros(z_latent.shape[0]),
             latent_grad=jnp.zeros_like(z_latent),
+            dual=jnp.zeros_like(z_latent),
         )
         config = {"window_shape": (2, 2), "stride": (2, 2), "padding": "VALID"}
         node_info = self._build_node_info(node, (14, 14, C), config)
@@ -237,6 +238,7 @@ class TestMaxPoolForward:
             error=jnp.zeros_like(z_latent),
             energy=jnp.zeros(z_latent.shape[0]),
             latent_grad=jnp.zeros_like(z_latent),
+            dual=jnp.zeros_like(z_latent),
         )
         config = {"window_shape": (2,), "stride": (2,), "padding": "VALID"}
         node_info = self._build_node_info(node, (10, C), config)
@@ -262,6 +264,7 @@ class TestMaxPoolForward:
             error=jnp.zeros_like(z_latent),
             energy=jnp.zeros(z_latent.shape[0]),
             latent_grad=jnp.zeros_like(z_latent),
+            dual=jnp.zeros_like(z_latent),
         )
         config = {"window_shape": (2, 2), "stride": (2, 2), "padding": "VALID"}
         node_info = self._build_node_info(node, (4, 4, C), config)
@@ -296,6 +299,7 @@ class TestMaxPoolForward:
             error=jnp.zeros_like(z_latent),
             energy=jnp.zeros(z_latent.shape[0]),
             latent_grad=jnp.zeros_like(z_latent),
+            dual=jnp.zeros_like(z_latent),
         )
         config = {"window_shape": (2, 2), "stride": (2, 2), "padding": "VALID"}
         node_info = self._build_node_info(node, (2, 2, 1), config)
@@ -334,6 +338,7 @@ def _make_state(z_latent):
         error=jnp.zeros_like(z_latent),
         energy=jnp.zeros(z_latent.shape[0]),
         latent_grad=jnp.zeros_like(z_latent),
+        dual=jnp.zeros_like(z_latent),
     )
 
 

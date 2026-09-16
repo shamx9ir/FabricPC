@@ -44,6 +44,7 @@ from fabricpc.core.inference import (
     InferenceBase,
     InferenceSGD,
     InferenceSGDNormClip,
+    InferenceALM,
     gather_inputs,
     run_inference,
 )
@@ -96,6 +97,7 @@ __all__ = [
     "InferenceBase",
     "InferenceSGD",
     "InferenceSGDNormClip",
+    "InferenceALM",
     "gather_inputs",
     "run_inference",
     # Initializers

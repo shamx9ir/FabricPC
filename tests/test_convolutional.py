@@ -62,6 +62,7 @@ def _make_state(key, batch_size, node_shape):
         error=jnp.zeros_like(z_latent),
         energy=jnp.zeros(batch_size),
         latent_grad=jnp.zeros_like(z_latent),
+        dual=jnp.zeros_like(z_latent),
     )
 
 

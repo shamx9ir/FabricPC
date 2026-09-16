@@ -356,6 +356,285 @@ class InferenceSGDNormClip(InferenceBase):
         )
 
 
+class InferenceALM(InferenceBase):
+    """
+    Augmented Lagrangian Predictive Coding (PC-ALM) inference.
+
+    Implements the PC-ALM algorithm from:
+        Seely & Gould, "Augmented Lagrangian Predictive Coding", arXiv:2605.31022
+
+    PC-ALM augments standard PC inference with per-layer Lagrange multipliers
+    (dual variables) that accumulate prediction errors across inference steps.
+    At convergence in linear networks, the duals recover exact backpropagation
+    gradients. In nonlinear networks, PC-ALM closes the PC-BP gap, especially
+    in deep narrow regimes where standard PC underperforms.
+
+    The algorithm alternates primal (latent) and dual (multiplier) updates:
+      - Primal step: gradient descent on the augmented Lagrangian L_rho
+      - Dual step: lambda_i += alpha * (z_latent_i - z_mu_i)
+
+    For each node, the augmented Lagrangian gradient equals the standard PC
+    energy gradient with z_latent shifted by +dual/rho (the completed-square
+    form, Eq. 9). The shift is applied per-node so that predecessors' inputs
+    remain unshifted and the supervised loss at clamped output nodes is correct.
+
+    After T-1 primal+dual cycles and a final primal step, the training
+    pipeline uses compute_local_weight_gradients_alm to shift each node's
+    z_latent by +dual/rho for its own weight gradient computation.
+
+    Args:
+        eta_infer: Inference learning rate for the primal step (default: 0.1)
+        infer_steps: Total inference iterations T (default: 20).
+            The paper recommends T = 2*L where L is network depth.
+        alpha: Dual step size (default: 1.0). Controls how fast the Lagrange
+            multiplier accumulates prediction errors. alpha=0 recovers standard PC.
+        rho: Penalty strength (default: 1.0). Should match the Gaussian energy
+            precision. Used to compute the prediction-target shift -lambda/rho.
+        latent_decay: Weight decay on latent states (default: 0.0).
+
+    Example:
+        from fabricpc.core.inference import InferenceALM
+
+        structure = graph(
+            nodes=[...], edges=[...], task_map=...,
+            inference=InferenceALM(eta_infer=0.1, infer_steps=40, alpha=1.0, rho=1.0),
+        )
+    """
+
+    def __init__(
+        self,
+        eta_infer=0.1,
+        infer_steps=20,
+        alpha=1.0,
+        rho=1.0,
+        latent_decay=0.0,
+    ):
+        super().__init__(
+            eta_infer=eta_infer,
+            infer_steps=infer_steps,
+            alpha=alpha,
+            rho=rho,
+            latent_decay=latent_decay,
+        )
+
+    @staticmethod
+    def inference_step(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """
+        Single PC-ALM inference step: primal update on the augmented Lagrangian.
+
+        For each node, shifts ONLY that node's z_latent by +dual/rho before
+        computing energy gradients (the completed-square form, Eq. 9). Inputs
+        from predecessors are always gathered from the unshifted global state,
+        so the supervised loss (at clamped output nodes) sees the correct
+        prediction targets.
+
+        Does NOT include the dual update -- that is handled by the outer loop
+        in run_inference() to implement Algorithm 1's structure of T-1
+        primal+dual cycles followed by one final primal step.
+        """
+        rho = config["rho"]
+
+        # Phase 1: Zero the latent gradients
+        state = InferenceALM.zero_grads(params, state, clamps, structure)
+
+        # Phase 2: Per-node forward + AL gradient computation.
+        # For each node, we gather inputs from the UNSHIFTED global state,
+        # then shift only this node's z_latent by +dual/rho before autodiff.
+        # This produces the correct augmented Lagrangian gradients:
+        #   self_grad = rho*error + lambda
+        #   input_grads = -(rho*error + lambda) * d(z_mu)/d(input)
+        state = InferenceALM.forward_value_and_grad_alm(
+            params, state, clamps, structure, rho
+        )
+
+        # Phase 3: Update latents (primal step): z -= eta * grad_AL
+        state = InferenceALM.update_latents(
+            params, state, clamps, structure, config
+        )
+
+        return state
+
+    @staticmethod
+    def forward_value_and_grad_alm(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        rho: float,
+    ) -> GraphState:
+        """
+        Forward pass + gradient computation for the augmented Lagrangian.
+
+        Like InferenceBase.forward_value_and_grad, but for each non-clamped
+        internal node, temporarily shifts z_latent by +dual/rho before the
+        energy autodiff. This implements the completed-square identity
+        (Eq. 9) per-node, so inputs from predecessors remain unshifted.
+        """
+        for node_name in structure.nodes:
+            node = structure.nodes[node_name]
+            node_info = node.node_info
+            node_class = node_info.node_class
+            node_state = state.nodes[node_name]
+            node_params = params.nodes[node_name]
+
+            # Gather inputs from the UNSHIFTED global state
+            in_edges_data = gather_inputs(node_info, structure, state)
+
+            # Pre-scale inputs by muPC forward scaling factors
+            sc = node_info.scaling_config
+            scaled_inputs = scale_inputs(in_edges_data, sc)
+
+            # For ALM: shift this node's z_latent by +dual/rho.
+            # This makes the autodiff produce augmented Lagrangian gradients.
+            is_clamped = node_name in clamps
+            if not is_clamped and node_info.in_degree > 0:
+                shifted_z = node_state.z_latent + node_state.dual / rho
+                node_state_for_grad = node_state._replace(z_latent=shifted_z)
+            else:
+                node_state_for_grad = node_state
+
+            # Compute predictions, error, and gradients
+            node_state_out, inedge_grads, self_grad = (
+                node_class.forward_and_latent_grads(
+                    node_params,
+                    scaled_inputs,
+                    node_state_for_grad,
+                    node_info,
+                    is_clamped=is_clamped,
+                )
+            )
+
+            # Restore the ORIGINAL z_latent (not the shifted one) and keep
+            # z_mu from the forward pass (which used unshifted predecessor
+            # inputs, so z_mu is correct). Recompute error from the original.
+            original_z = state.nodes[node_name].z_latent
+            node_state = node_state_out._replace(
+                z_latent=original_z,
+                error=original_z - node_state_out.z_mu,
+            )
+
+            # Scale and accumulate gradients (same as standard PC)
+            inedge_grads = scale_input_grads(inedge_grads, sc)
+            self_grad = scale_self_grad(self_grad, sc)
+            node_state = node_state._replace(
+                latent_grad=node_state.latent_grad + self_grad
+            )
+
+            # Update the graph state
+            state = state._replace(nodes={**state.nodes, node_name: node_state})
+
+            # Accumulate gradient contributions to predecessors
+            for edge_key, grad in inedge_grads.items():
+                source_name = structure.edges[edge_key].source
+                latent_grad = state.nodes[source_name].latent_grad + grad
+                state = update_node_in_state(
+                    state, source_name, latent_grad=latent_grad
+                )
+
+        return state
+
+    @staticmethod
+    def dual_step(
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """
+        Dual update: accumulate prediction errors into Lagrange multipliers.
+
+        For each non-clamped internal node:
+            lambda_i += alpha * (z_latent_i - z_mu_i)
+
+        where z_latent is the post-primal-update value and z_mu is the
+        prediction from the forward pass (Eq. 12 in the paper).
+
+        Args:
+            state: Graph state after a primal step.
+            clamps: Clamped node values.
+            structure: Graph structure.
+            config: Inference configuration containing 'alpha'.
+
+        Returns:
+            Updated graph state with modified dual variables.
+        """
+        alpha = config["alpha"]
+
+        for node_name in structure.nodes:
+            node_info = structure.nodes[node_name].node_info
+            # Only update duals for non-clamped internal nodes (in_degree > 0).
+            # Source nodes (in_degree=0) have no constraint h_i = sigma(W_i h_{i-1}).
+            # Clamped nodes have fixed z_latent.
+            if node_name not in clamps and node_info.in_degree > 0:
+                ns = state.nodes[node_name]
+                # Residual: r_i = z_latent - z_mu (prediction error)
+                residual = ns.z_latent - ns.z_mu
+                new_dual = ns.dual + alpha * residual
+                state = update_node_in_state(state, node_name, dual=new_dual)
+
+        return state
+
+    @staticmethod
+    def compute_new_latent(node_name, node_state, config):
+        """Standard SGD update for the primal step."""
+        eta_infer = config["eta_infer"]
+        latent_decay = config["latent_decay"]
+
+        new_latent = (
+            node_state.z_latent * (1.0 - eta_infer * latent_decay)
+            - eta_infer * node_state.latent_grad
+        )
+        return new_latent
+
+    @staticmethod
+    def run_inference(
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """
+        PC-ALM outer inference loop (Algorithm 1 from the paper).
+
+        Runs T-1 primal+dual cycles followed by one final primal step.
+        The dual variables (Lagrange multipliers) accumulate prediction errors
+        and are stored in each node's ``dual`` field for use by the weight
+        gradient computation.
+
+        After inference, the final state contains both the converged latents
+        and the accumulated duals needed for the augmented Lagrangian weight
+        gradient.
+        """
+        inference_obj = structure.config["inference"]
+        config = inference_obj.config
+        infer_steps = config["infer_steps"]
+
+        def body_fn(t, state):
+            # Primal step (gradient descent on augmented Lagrangian)
+            state = InferenceALM.inference_step(
+                params, state, clamps, structure, config
+            )
+            # Dual step (accumulate prediction errors)
+            state = InferenceALM.dual_step(state, clamps, structure, config)
+            return state
+
+        # T-1 primal+dual cycles
+        state = jax.lax.fori_loop(0, infer_steps - 1, body_fn, initial_state)
+
+        # Final primal step (no dual update after the last one)
+        state = InferenceALM.inference_step(
+            params, state, clamps, structure, config
+        )
+
+        return state
+
+
 # =============================================================================
 # Convenience Function
 # =============================================================================

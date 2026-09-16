@@ -15,8 +15,11 @@ import optax
 from tqdm.auto import tqdm as _tqdm_cls
 
 from fabricpc.core.types import GraphParams, GraphState, GraphStructure
-from fabricpc.core.inference import run_inference
-from fabricpc.core.learning import compute_local_weight_gradients
+from fabricpc.core.inference import run_inference, InferenceALM
+from fabricpc.core.learning import (
+    compute_local_weight_gradients,
+    compute_local_weight_gradients_alm,
+)
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 
 # ── pmap utilities ──────────────────────────────────────────────────
@@ -161,8 +164,17 @@ def get_graph_param_gradient(
     )
     energy = energy / batch_size
 
-    # Compute LOCAL gradients for each node
-    grads = compute_local_weight_gradients(params, final_state, structure)
+    # Compute LOCAL gradients for each node.
+    # When using PC-ALM inference, the augmented Lagrangian weight gradient
+    # shifts each node's z_latent by +dual/rho to incorporate the dual signal.
+    inference_obj = structure.config["inference"]
+    if isinstance(inference_obj, InferenceALM):
+        rho = inference_obj.config["rho"]
+        grads = compute_local_weight_gradients_alm(
+            params, final_state, structure, rho
+        )
+    else:
+        grads = compute_local_weight_gradients(params, final_state, structure)
 
     return grads, energy, final_state
 

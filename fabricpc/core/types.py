@@ -118,6 +118,8 @@ class NodeState(NamedTuple):
         error: Prediction errors (z_latent - z_mu)
         energy: Energy
         latent_grad: Gradients w.r.t. latent states for inference updates
+        dual: Lagrange multiplier for augmented Lagrangian inference (PC-ALM).
+            Zero for standard PC; accumulates prediction errors during ALM inference.
     """
 
     z_latent: jnp.ndarray
@@ -125,6 +127,7 @@ class NodeState(NamedTuple):
     error: jnp.ndarray
     energy: jnp.ndarray  # per-sample energy, shape (batch_size,)
     latent_grad: jnp.ndarray  # For local gradient accumulation
+    dual: jnp.ndarray  # Lagrange multiplier for PC-ALM (zero for standard PC)
 
 
 class GraphState(NamedTuple):
@@ -194,6 +197,7 @@ tree_util.register_pytree_node(
             ns.error,
             ns.energy,
             ns.latent_grad,
+            ns.dual,
         ),
         None,
     ),
