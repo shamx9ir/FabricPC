@@ -635,6 +635,180 @@ class InferenceALM(InferenceBase):
         return state
 
 
+class InferenceALMNormClip(InferenceALM):
+    """
+    ALM inference with per-node gradient norm clipping on the primal step.
+
+    Combines InferenceALM's dual variable mechanism with
+    InferenceSGDNormClip's per-node gradient clipping. This stabilizes
+    deep-network primal updates where ALM gradients can explode through
+    long chains of local Jacobians.
+
+    Args:
+        eta_infer: Inference rate (default: 0.1).
+        infer_steps: Total inference iterations T (default: 20).
+        alpha: Dual step size (default: 1.0).
+        rho: Penalty strength (default: 1.0).
+        max_norm: Maximum gradient norm per node (default: 1.0).
+        eps: Numerical stability constant (default: 1e-8).
+        latent_decay: Weight decay on latent states (default: 0.0).
+    """
+
+    def __init__(
+        self,
+        eta_infer=0.1,
+        infer_steps=20,
+        alpha=1.0,
+        rho=1.0,
+        max_norm=1.0,
+        eps=1e-8,
+        latent_decay=0.0,
+    ):
+        # Build the full config dict before freezing (MappingProxyType)
+        InferenceBase.__init__(
+            self,
+            eta_infer=eta_infer,
+            infer_steps=infer_steps,
+            alpha=alpha,
+            rho=rho,
+            latent_decay=latent_decay,
+            max_norm=max_norm,
+            eps=eps,
+        )
+
+    @staticmethod
+    def compute_new_latent(node_name, node_state, config):
+        """Norm-clipped SGD update for the primal step."""
+        eta_infer = config["eta_infer"]
+        latent_decay = config["latent_decay"]
+        max_norm = config["max_norm"]
+        eps = config["eps"]
+
+        grad = node_state.latent_grad
+        grad_norm = jnp.sqrt(
+            jnp.sum(grad.conj() * grad, axis=tuple(range(1, grad.ndim)), keepdims=True)
+        )
+        clip_factor = jnp.minimum(1.0, max_norm / (grad_norm + eps))
+        clipped_grad = grad * clip_factor
+
+        return (
+            node_state.z_latent * (1.0 - eta_infer * latent_decay)
+            - eta_infer * clipped_grad
+        )
+
+
+class InferenceALMBidir(InferenceALM):
+    """
+    ALM inference with bidirectional node sweeps.
+
+    Each inference step performs the forward+gradient computation twice:
+    once in topological order (input→output) and once in reverse
+    (output→input). This doubles the per-step information propagation
+    distance, allowing error signals to traverse the full network depth
+    in half the number of iterations.
+
+    The dual update is performed once after both sweeps.
+
+    Args:
+        eta_infer: Inference rate (default: 0.1).
+        infer_steps: Total inference iterations T (default: 20).
+        alpha: Dual step size (default: 1.0).
+        rho: Penalty strength (default: 1.0).
+        latent_decay: Weight decay on latent states (default: 0.0).
+    """
+
+    @staticmethod
+    def forward_value_and_grad_alm_reverse(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        rho: float,
+    ) -> GraphState:
+        """Same as forward_value_and_grad_alm but iterates nodes in reverse."""
+        for node_name in reversed(list(structure.nodes)):
+            node = structure.nodes[node_name]
+            node_info = node.node_info
+            node_class = node_info.node_class
+            node_state = state.nodes[node_name]
+            node_params = params.nodes[node_name]
+
+            in_edges_data = gather_inputs(node_info, structure, state)
+            sc = node_info.scaling_config
+            scaled_inputs = scale_inputs(in_edges_data, sc)
+
+            is_clamped = node_name in clamps
+            if not is_clamped and node_info.in_degree > 0:
+                shifted_z = node_state.z_latent + node_state.dual / rho
+                node_state_for_grad = node_state._replace(z_latent=shifted_z)
+            else:
+                node_state_for_grad = node_state
+
+            node_state_out, inedge_grads, self_grad = (
+                node_class.forward_and_latent_grads(
+                    node_params,
+                    scaled_inputs,
+                    node_state_for_grad,
+                    node_info,
+                    is_clamped=is_clamped,
+                )
+            )
+
+            original_z = state.nodes[node_name].z_latent
+            node_state = node_state_out._replace(
+                z_latent=original_z,
+                error=original_z - node_state_out.z_mu,
+            )
+
+            inedge_grads = scale_input_grads(inedge_grads, sc)
+            self_grad = scale_self_grad(self_grad, sc)
+            node_state = node_state._replace(
+                latent_grad=node_state.latent_grad + self_grad
+            )
+
+            state = state._replace(nodes={**state.nodes, node_name: node_state})
+
+            for edge_key, grad in inedge_grads.items():
+                source_name = structure.edges[edge_key].source
+                latent_grad = state.nodes[source_name].latent_grad + grad
+                state = update_node_in_state(
+                    state, source_name, latent_grad=latent_grad
+                )
+
+        return state
+
+    @staticmethod
+    def inference_step(
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+        config: Dict[str, Any],
+    ) -> GraphState:
+        """Bidirectional ALM inference step: forward sweep then reverse sweep."""
+        rho = config["rho"]
+
+        # Phase 1: Zero grads
+        state = InferenceALMBidir.zero_grads(params, state, clamps, structure)
+
+        # Phase 2a: Forward sweep (input→output)
+        state = InferenceALM.forward_value_and_grad_alm(
+            params, state, clamps, structure, rho
+        )
+
+        # Phase 2b: Reverse sweep (output→input) — accumulates on top
+        state = InferenceALMBidir.forward_value_and_grad_alm_reverse(
+            params, state, clamps, structure, rho
+        )
+
+        # Phase 3: Update latents
+        state = InferenceALMBidir.update_latents(
+            params, state, clamps, structure, config
+        )
+
+        return state
+
+
 # =============================================================================
 # Convenience Function
 # =============================================================================
