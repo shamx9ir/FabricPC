@@ -58,6 +58,14 @@ inference = InferenceSGD(eta_infer=0.05, infer_steps=20)
 
 During training, the input node is clamped to `x` (the batch data) and the output node is clamped to `y` (the target labels). These clamped nodes provide boundary conditions, and the inference loop adjusts all unclamped latent states to minimize the total network energy given these constraints.
 
+#### Two solvers for the inner loop
+
+The state-based update above moves the error signal one hop per step, so on deep graphs it needs many steps for the output clamp to reach early layers. Its `eta_infer` is a per-node rate.
+
+`EPCInference` minimizes the same energy in error coordinates. The prediction errors are the relaxed variables, the latents are derived by one forward pass (`z_latent = z_mu + error`), and one global reverse pass per step delivers the loss signal to every layer at once, so a few steps replace hundreds on deep DAGs at backprop-scale memory per step. Its `eta_infer` is one global rate through the whole network, bounded by the spectrum of the energy's Hessian in error coordinates, which is measured from the graph rather than chosen from a range. The two parameterizations share the same equilibria on DAGs, and `InferenceSchedule` composes them per weight update (a few ePC steps, then sPC refinement). On cyclic graphs, built with `graph(..., unroll=U)`, the state-based solvers relax the exact graph energy while ePC minimizes its unrolled approximation at degree U.
+
+ePC is backprop when its steps leave the errors near the starting gradient: one step from zero error leaves each error at minus the rate times backprop's activation gradient, and a small rate times step count on the error modes that carry the gradient leaves the weight gradients at backprop's with rescaled magnitude. `EPCInference.regime` reads which case a run is in from the measured spectrum; read it before reporting a run as PC. [Training with ePC](17_training_with_epc.md) gives the workflow and the [Inference Algorithms API](12_api_inference.md) the update rule.
+
 ### Outer Loop: Learning
 
 The **learning loop** updates weights using gradients computed from the converged states. After inference reaches equilibrium, each node computes local weight gradients based on its prediction error and the activity of its inputs. This is a Hebbian-like learning rule:
@@ -66,13 +74,14 @@ The **learning loop** updates weights using gradients computed from the converge
 dE/dW ~ error * input_activity
 ```
 
-In FabricPC, local gradients are computed by `compute_local_weight_gradients`, then an Optax optimizer (e.g., Adam, SGD) applies the updates:
+In FabricPC, local gradients are computed by `compute_local_weight_gradients` (batch-summed), divided once by the batch's prediction count in the trainer's `pc_weight_gradients`, and then an Optax optimizer (e.g., Adam, SGD) applies the updates:
 
 ```python
 import optax
+from fabricpc.training import train
 
 optimizer = optax.adamw(0.001, weight_decay=0.1)
-trained_params, _, _ = train_pcn(
+result = train(
     params=params,
     structure=structure,
     train_loader=train_loader,
@@ -80,6 +89,7 @@ trained_params, _, _ = train_pcn(
     config={"num_epochs": 20},
     rng_key=train_key,
 )
+trained_params = result.params
 ```
 
 The key difference from backpropagation: weight gradients are computed **locally** at each node from local information (its own error and inputs), not via a global backward pass through the network.
@@ -181,16 +191,19 @@ hidden_energy = final_state.nodes["hidden1"].energy  # Shape: (32,) - per-sample
 | **Network topology** | Arbitrary graphs (cycles, skip connections) | Typically acyclic (DAGs) |
 | **Biological plausibility** | High (local learning, iterative dynamics) | Low (global error signals, weight transport problem) |
 
+The inference rows describe the state-based solvers. Under `EPCInference` each inference step is one global reverse pass through the network, so the iteration is global rather than one hop per step; the weight gradients stay local to each node.
+
 ### When They Agree
 
 Under certain conditions, predictive coding converges to the same solution as backpropagation:
 - Feedforward topology (no recurrent connections)
 - Linear nodes or small learning rates
 - Inference fully converged before weight updates
+- Under `EPCInference`, a single inference step, or a rate times step count that is small on the error modes carrying the gradient; the regime label reports which case a run is in ([Training with ePC](17_training_with_epc.md))
 
-FabricPC provides both modes on the same graph structure:
-- `train_pcn` — Predictive coding with local learning rules
-- `train_backprop` — Standard backpropagation for comparison
+FabricPC provides both modes on the same graph structure through `train`'s `algorithm` argument:
+- `train(..., algorithm="pc")` — Predictive coding with local learning rules (the default)
+- `train(..., algorithm="backprop")` — Standard backpropagation for comparison
 
 This allows direct A/B testing of the two approaches on identical architectures.
 

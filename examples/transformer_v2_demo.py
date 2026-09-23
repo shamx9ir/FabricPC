@@ -13,8 +13,10 @@ Architecture (each transformer block decomposed into separate PC nodes)::
     Each block: MhaResidual(in + mask) ──→ LnMlp1 ──→ Mlp2Residual(in + skip)
 
 Supports two training modes:
-  - Predictive Coding (PC): Local Hebbian learning with multi-GPU pmap support
-  - Backpropagation: Standard end-to-end gradient training (single device)
+  - Predictive Coding (PC): local Hebbian learning
+  - Backpropagation: standard end-to-end gradient training
+Both run through fabricpc.training.train; pass a mesh for data parallelism
+(see examples/mnist_multi_gpu.py).
 
 Usage:
     PYTHONPATH=. python examples/transformer_v2_demo.py
@@ -22,34 +24,30 @@ Usage:
     PYTHONPATH=. python examples/transformer_v2_demo.py --mode pc --depth 6 --num_epochs 10
 
 
-Results (default call, cuda12, rtx3090, jax 0.8.1, can vary a few points in perplexity in different jax versions / hardware due to sensitivity to floating point rounding):
+Results (default call, cuda12, rtx3090, jax 0.10.1, can vary
+a few points in perplexity in different jax versions / hardware due to
+sensitivity to floating point rounding).
 Model parameters: 108,353
 Vocab Size: 65
-Train Epoch 1/5, Energy: 274.3637, Loss: 2.1401, Perplexity: 8.50
-Train Epoch 2/5, Energy: 260.0219, Loss: 2.0280, Perplexity: 7.60
-Train Epoch 3/5, Energy: 250.6280, Loss: 1.9546, Perplexity: 7.06
-Train Epoch 4/5, Energy: 244.7030, Loss: 1.9089, Perplexity: 6.75
-Train Epoch 5/5, Energy: 242.0046, Loss: 1.8878, Perplexity: 6.61
-Training completed in 8772.4s
-Evaluation completed in 55.2s
-Test Accuracy:   35.92%
-Test CE Loss:    2.2108
-Test Perplexity: 9.12
+Epoch 1/5 — energy: 2.1198, target_energy: 2.1165
+Epoch 2/5 — energy: 1.9861, target_energy: 1.9826
+Epoch 3/5 — energy: 2.0056, target_energy: 2.0024
+Epoch 4/5 — energy: 1.9770, target_energy: 1.9741
+Epoch 5/5 — energy: 1.9691, target_energy: 1.9663
+Training completed in 8730.8s
+Evaluation completed in 43.7s
+Test Accuracy:   33.43%
+Test CE Loss:    2.3383
+Test Perplexity: 10.36
 --- Generating ---
-ROMEO: whou sarone the bro beariers thas tray sucas a st my lo the to ate.
+ROMEO: marencan net s ieat aceaimes thall dathak: Tha blag an wince'd ate.
 """
 
 import argparse
 import jax
 import jax.numpy as jnp
 from fabricpc.graph_initialization import initialize_params
-from fabricpc.training import (
-    train_autoregressive,
-    evaluate_autoregressive,
-    train_backprop_autoregressive,
-    evaluate_backprop_autoregressive,
-    generate_autoregressive,
-)
+from fabricpc.training import evaluate, generate, IterContext, train
 from fabricpc.core.inference import InferenceSGDNormClip
 from fabricpc.models import create_deep_transformer
 from fabricpc.utils.data import CharDataLoader, BpeDataLoader
@@ -140,10 +138,13 @@ def parse_args():
         "--batch_size",
         type=int,
         default=None,
-        help="Batch size (per-device for PC, total for backprop; default: tuned per --tokenizer)",
+        help="Batch size (default: tuned per --tokenizer)",
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=5, help="Number of training epochs"
+        "--num_epochs",
+        type=float,
+        default=5,
+        help="Number of training epochs (supports fractional)",
     )
     parser.add_argument(
         "--lr",
@@ -198,13 +199,8 @@ def main(args=None):
             setattr(args, key, val)
 
     # --- Batch size ---
-    if use_pc:
-        n_devices = jax.device_count()
-        batch_size = args.batch_size * n_devices
-        print(f"PC mode: {n_devices} device(s), total batch_size={batch_size}")
-    else:
-        batch_size = args.batch_size
-        print(f"Backprop mode: single device, batch_size={batch_size}")
+    batch_size = args.batch_size
+    print(f"{'PC' if use_pc else 'Backprop'} mode: batch_size={batch_size}")
 
     # --- Data ---
     if use_bpe:
@@ -258,14 +254,11 @@ def main(args=None):
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"Model parameters: {n_params:,}")
 
-    train_config = {
-        "num_epochs": args.num_epochs,
-        "use_causal_mask": True,
-    }
+    train_config = {"num_epochs": args.num_epochs}
     steps_per_epoch = train_loader.num_sequences // batch_size
     schedule = optax.cosine_decay_schedule(
         init_value=args.lr,
-        decay_steps=args.num_epochs * steps_per_epoch,
+        decay_steps=max(1, round(args.num_epochs * steps_per_epoch)),
         alpha=0.1,
     )
     optimizer = optax.adam(schedule)
@@ -273,51 +266,42 @@ def main(args=None):
     print(f"Vocab Size: {vocab_size}")
     start = time.time()
 
-    def iter_callback(epoch_idx, batch_idx, energy):
-        if args.verbose and (batch_idx + 1) % 50 == 0:
+    def iter_callback(ctx: IterContext):
+        if args.verbose and (ctx.batch_idx + 1) % 50 == 0:
             print(
-                f"Epoch {epoch_idx + 1} | Batch {batch_idx + 1} | Energy: {energy:.4f}"
+                f"Epoch {ctx.epoch_idx + 1} | Batch {ctx.batch_idx + 1} | "
+                f"Energy: {ctx.metrics['energy']:.4f}"
             )
-        return energy
 
-    if use_pc:
-        trained_params, _, _ = train_autoregressive(
-            params,
-            structure,
-            train_loader,
-            optimizer,
-            train_config,
-            train_key,
-            verbose=True,
-            iter_callback=iter_callback,
-        )
-    else:
-        trained_params, _, _ = train_backprop_autoregressive(
-            params,
-            structure,
-            train_loader,
-            optimizer,
-            train_config,
-            train_key,
-            verbose=True,
-        )
+    result = train(
+        params,
+        structure,
+        train_loader,
+        optimizer,
+        train_config,
+        train_key,
+        algorithm="pc" if use_pc else "backprop",
+        verbose=True,
+        iter_callback=iter_callback if args.verbose else None,
+    )
+    trained_params = result.params
 
     print(f"Training completed in {time.time() - start:.1f}s")
 
     # --- Evaluate ---
     eval_start = time.time()
-    if use_pc:
-        metrics = evaluate_autoregressive(
-            trained_params, structure, test_loader, train_config, eval_key
-        )
-    else:
-        metrics = evaluate_backprop_autoregressive(
-            trained_params, structure, test_loader, train_config, eval_key
-        )
+    metrics = evaluate(
+        trained_params,
+        structure,
+        test_loader,
+        train_config,
+        eval_key,
+        algorithm="pc" if use_pc else "backprop",
+    )
     print(f"Evaluation completed in {time.time() - eval_start:.1f}s")
 
     print(f"Test Accuracy:   {metrics['accuracy'] * 100:.2f}%")
-    print(f"Test CE Loss:    {metrics['loss']:.4f}")
+    print(f"Test CE Loss:    {metrics['cross_entropy']:.4f}")
     print(f"Test Perplexity: {metrics['perplexity']:.2f}")
 
     # --- Text Generation ---
@@ -334,13 +318,14 @@ def main(args=None):
     prompt = jnp.array(current_indices, dtype=jnp.int32)
 
     print("--- Generating ---")
-    generated = generate_autoregressive(
+    generated = generate(
         trained_params,
         structure,
         prompt,
         max_new_tokens=200,
         rng_key=gen_key,
         temperature=0.8,
+        algorithm="pc" if use_pc else "backprop",
     )
 
     # Decode - skip the prompt padding, decode only from where prompt starts

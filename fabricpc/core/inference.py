@@ -7,7 +7,7 @@ This module provides:
 - run_inference: Convenience function wrapping the class-based API
 
 Inference algorithms control how latent states are updated during the
-inference loop. The primary extension point is `latent_update()`.
+inference loop. The primary extension point is `compute_new_latent()`.
 
 Usage:
     from fabricpc.core.inference import InferenceSGD
@@ -73,18 +73,21 @@ class InferenceBase(ABC):
     Abstract base class for inference algorithms.
 
     Inference algorithms control how latent states are updated during the
-    inference loop. The primary extension point is `latent_update()`.
+    inference loop. The primary extension point is `compute_new_latent()`.
 
-    Custom inference algorithms extend this class:
+    Custom inference algorithms extend this class.
 
-    All computation methods are static for JAX compatibility (pure functions, no state).
+    Computation methods are classmethods dispatching on ``cls`` (pure
+    functions of their arguments, no instance state); ``run_inference`` is an
+    instance method because it reads ``self.config``.
     """
 
     def __init__(self, **config):
         self.config = types.MappingProxyType(config)  # Immutable dictionary
 
-    @staticmethod
+    @classmethod
     def inference_step(
+        cls,
         params: GraphParams,
         state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -97,9 +100,6 @@ class InferenceBase(ABC):
         Override for algorithms that need a different phase structure
         (e.g., momentum that accumulates across steps).
         """
-        inference_obj = structure.config["inference"]
-        cls = type(inference_obj)
-
         # Phase 1: Zero the latent gradients
         state = cls.zero_grads(params, state, clamps, structure)
 
@@ -131,8 +131,9 @@ class InferenceBase(ABC):
 
         return state
 
-    @staticmethod
+    @classmethod
     def forward_value_and_grad(
+        cls,
         params: GraphParams,
         state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -198,8 +199,9 @@ class InferenceBase(ABC):
 
         return state
 
-    @staticmethod
+    @classmethod
     def update_latents(
+        cls,
         params: GraphParams,
         state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -209,9 +211,6 @@ class InferenceBase(ABC):
         """
         Update latent states for each node based on the accumulated latent gradients.
         """
-        inference_obj = structure.config["inference"]
-        cls = type(inference_obj)
-
         for node_name in structure.nodes:
             node_state = state.nodes[node_name]
 
@@ -242,8 +241,52 @@ class InferenceBase(ABC):
         """
         pass
 
-    @staticmethod
+    @classmethod
+    def begin_segment(
+        cls,
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """
+        Segment-boundary hook run before this solver's first inference step.
+
+        The default is identity: the incoming z_latent/z_mu/error are taken
+        exactly as the previous segment (or the initializer) left them.
+        """
+        return state
+
+    @classmethod
+    def finalize_state(
+        cls,
+        params: GraphParams,
+        state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """
+        Segment-boundary hook run after this solver's last inference step.
+
+        The default is identity. Solvers whose per-step state is not the
+        consumable final state override this (e.g. a rebuild so downstream
+        weight updates and dashboards read a self-consistent state).
+        """
+        return state
+
+    def segments(self):
+        """
+        The (solver, steps) segments this inference object executes.
+
+        A plain solver is a single segment of its own ``infer_steps``.
+        Schedule objects override this to flatten their component solvers,
+        so per-step consumers (e.g. tracking) can iterate segments instead
+        of assuming one global step count.
+        """
+        return ((self, int(self.config["infer_steps"])),)
+
     def run_inference(
+        self,
         params: GraphParams,
         initial_state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -255,19 +298,18 @@ class InferenceBase(ABC):
         Override for scan-based tracking, adaptive stopping, etc.
         infer_steps is read from self.config['infer_steps'].
         """
-        inference_obj = structure.config["inference"]
-        inference_cls = type(inference_obj)
-        config = inference_obj.config
+        cls = type(self)
+        config = self.config
         infer_steps = config["infer_steps"]
 
+        state = cls.begin_segment(params, initial_state, clamps, structure)
+
         def body_fn(t, state):
-            return inference_cls.inference_step(
-                params, state, clamps, structure, config
-            )
+            return cls.inference_step(params, state, clamps, structure, config)
 
         # Use lax.fori_loop for efficiency
-        final_state = jax.lax.fori_loop(0, infer_steps, body_fn, initial_state)
-        return final_state
+        state = jax.lax.fori_loop(0, infer_steps, body_fn, state)
+        return cls.finalize_state(params, state, clamps, structure)
 
 
 # =============================================================================
@@ -441,175 +483,7 @@ class InferenceALM(InferenceBase):
         structure: GraphStructure,
         config: Dict[str, Any],
     ) -> GraphState:
-        """
-        Single PC-ALM inference step: primal update on the augmented Lagrangian.
 
-        For each node, shifts ONLY that node's z_latent by +dual/rho before
-        computing energy gradients (the completed-square form, Eq. 9). Inputs
-        from predecessors are always gathered from the unshifted global state,
-        so the supervised loss (at clamped output nodes) sees the correct
-        prediction targets.
-
-        Does NOT include the dual update -- that is handled by the outer loop
-        in run_inference() to implement Algorithm 1's structure of T-1
-        primal+dual cycles followed by one final primal step.
-        """
-        rho = config["rho"]
-
-        # Phase 1: Zero the latent gradients
-        state = InferenceALM.zero_grads(params, state, clamps, structure)
-
-        # Phase 2: Per-node forward + AL gradient computation.
-        # For each node, we gather inputs from the UNSHIFTED global state,
-        # then shift only this node's z_latent by +dual/rho before autodiff.
-        # This produces the correct augmented Lagrangian gradients:
-        #   self_grad = rho*error + lambda
-        #   input_grads = -(rho*error + lambda) * d(z_mu)/d(input)
-        state = InferenceALM.forward_value_and_grad_alm(
-            params, state, clamps, structure, rho
-        )
-
-        # Phase 3: Update latents (primal step): z -= eta * grad_AL
-        state = InferenceALM.update_latents(
-            params, state, clamps, structure, config
-        )
-
-        return state
-
-    @staticmethod
-    def forward_value_and_grad_alm(
-        params: GraphParams,
-        state: GraphState,
-        clamps: Dict[str, jnp.ndarray],
-        structure: GraphStructure,
-        rho: float,
-    ) -> GraphState:
-        """
-        Forward pass + gradient computation for the augmented Lagrangian.
-
-        Like InferenceBase.forward_value_and_grad, but for each non-clamped
-        internal node, temporarily shifts z_latent by +dual/rho before the
-        energy autodiff. This implements the completed-square identity
-        (Eq. 9) per-node, so inputs from predecessors remain unshifted.
-        """
-        for node_name in structure.nodes:
-            node = structure.nodes[node_name]
-            node_info = node.node_info
-            node_class = node_info.node_class
-            node_state = state.nodes[node_name]
-            node_params = params.nodes[node_name]
-
-            # Gather inputs from the UNSHIFTED global state
-            in_edges_data = gather_inputs(node_info, structure, state)
-
-            # Pre-scale inputs by muPC forward scaling factors
-            sc = node_info.scaling_config
-            scaled_inputs = scale_inputs(in_edges_data, sc)
-
-            # For ALM: shift this node's z_latent by +dual/rho.
-            # This makes the autodiff produce augmented Lagrangian gradients.
-            is_clamped = node_name in clamps
-            if not is_clamped and node_info.in_degree > 0:
-                shifted_z = node_state.z_latent + node_state.dual / rho
-                node_state_for_grad = node_state._replace(z_latent=shifted_z)
-            else:
-                node_state_for_grad = node_state
-
-            # Compute predictions, error, and gradients
-            node_state_out, inedge_grads, self_grad = (
-                node_class.forward_and_latent_grads(
-                    node_params,
-                    scaled_inputs,
-                    node_state_for_grad,
-                    node_info,
-                    is_clamped=is_clamped,
-                )
-            )
-
-            # Restore the ORIGINAL z_latent (not the shifted one) and keep
-            # z_mu from the forward pass (which used unshifted predecessor
-            # inputs, so z_mu is correct). Recompute error from the original.
-            original_z = state.nodes[node_name].z_latent
-            node_state = node_state_out._replace(
-                z_latent=original_z,
-                error=original_z - node_state_out.z_mu,
-            )
-
-            # Scale and accumulate gradients (same as standard PC)
-            inedge_grads = scale_input_grads(inedge_grads, sc)
-            self_grad = scale_self_grad(self_grad, sc)
-            node_state = node_state._replace(
-                latent_grad=node_state.latent_grad + self_grad
-            )
-
-            # Update the graph state
-            state = state._replace(nodes={**state.nodes, node_name: node_state})
-
-            # Accumulate gradient contributions to predecessors
-            for edge_key, grad in inedge_grads.items():
-                source_name = structure.edges[edge_key].source
-                latent_grad = state.nodes[source_name].latent_grad + grad
-                state = update_node_in_state(
-                    state, source_name, latent_grad=latent_grad
-                )
-
-        return state
-
-    @staticmethod
-    def dual_step(
-        state: GraphState,
-        clamps: Dict[str, jnp.ndarray],
-        structure: GraphStructure,
-        config: Dict[str, Any],
-    ) -> GraphState:
-        """
-        Dual update: accumulate prediction errors into Lagrange multipliers.
-
-        For each non-clamped internal node:
-            lambda_i += alpha * (z_latent_i - z_mu_i)
-
-        where z_latent is the post-primal-update value and z_mu is the
-        prediction from the forward pass (Eq. 12 in the paper).
-
-        Args:
-            state: Graph state after a primal step.
-            clamps: Clamped node values.
-            structure: Graph structure.
-            config: Inference configuration containing 'alpha'.
-
-        Returns:
-            Updated graph state with modified dual variables.
-        """
-        alpha = config["alpha"]
-
-        for node_name in structure.nodes:
-            node_info = structure.nodes[node_name].node_info
-            # Only update duals for non-clamped internal nodes (in_degree > 0).
-            # Source nodes (in_degree=0) have no constraint h_i = sigma(W_i h_{i-1}).
-            # Clamped nodes have fixed z_latent.
-            if node_name not in clamps and node_info.in_degree > 0:
-                ns = state.nodes[node_name]
-                # Residual: r_i = z_latent - z_mu (prediction error)
-                residual = ns.z_latent - ns.z_mu
-                new_dual = ns.dual + alpha * residual
-                state = update_node_in_state(state, node_name, dual=new_dual)
-
-        return state
-
-    @staticmethod
-    def compute_new_latent(node_name, node_state, config):
-        """Standard SGD update for the primal step."""
-        eta_infer = config["eta_infer"]
-        latent_decay = config["latent_decay"]
-
-        new_latent = (
-            node_state.z_latent * (1.0 - eta_infer * latent_decay)
-            - eta_infer * node_state.latent_grad
-        )
-        return new_latent
-
-    @staticmethod
-    def run_inference(
         params: GraphParams,
         initial_state: GraphState,
         clamps: Dict[str, jnp.ndarray],
@@ -712,6 +586,7 @@ class InferenceALMNormClip(InferenceALM):
             max_norm=max_norm,
             eps=eps,
             weight_credit_timing=weight_credit_timing,
+
         )
 
     @staticmethod
@@ -847,6 +722,76 @@ class InferenceALMBidir(InferenceALM):
         return state
 
 
+class InferenceSchedule(InferenceBase):
+    """
+    Composable inference schedule: solvers run as segments per weight update.
+
+    Usage:
+        inference = InferenceSchedule(
+            EPCInference(eta_infer=1e-3, infer_steps=2),
+            InferenceSGD(eta_infer=0.05, infer_steps=20),
+        )
+
+    The example composes a few cheap global ePC steps to near-equilibrium
+    with sPC refinement on the true arbitrary-graph energy (back edges
+    included), warm-started from ePC's solution.
+
+    Chained execution contract:
+    1. Node states are initialized once, by the graph's configured
+       initializer, before the first segment; no segment re-initializes.
+    2. Each solver receives z_latent exactly as the previous segment (or
+       the initializer) left it, and its ``begin_segment`` adapts the
+       derived fields to its own parameterization without moving the
+       latents — ePC recomputes ε := z_latent - z_mu at the carried
+       latents, so relaxation continues from the incoming latents rather
+       than from stale ε.
+    3. The next solver continues from the resulting state (after e.g. ePC's
+       ``finalize_state`` rebuild).
+
+    A schedule has no single per-step rule, so ``inference_step`` and
+    ``compute_new_latent`` raise; per-step consumers (tracking) iterate
+    ``segments()`` instead, which flattens nested schedules.
+    """
+
+    def __init__(self, *solvers):
+        if not solvers:
+            raise ValueError("InferenceSchedule requires at least one solver")
+        for solver in solvers:
+            if not isinstance(solver, InferenceBase):
+                raise TypeError(
+                    f"InferenceSchedule accepts InferenceBase instances; "
+                    f"got {type(solver).__name__}"
+                )
+        super().__init__(solvers=tuple(solvers))
+
+    def run_inference(
+        self,
+        params: GraphParams,
+        initial_state: GraphState,
+        clamps: Dict[str, jnp.ndarray],
+        structure: GraphStructure,
+    ) -> GraphState:
+        """Fold the state through each solver's run_inference in order."""
+        state = initial_state
+        for solver in self.config["solvers"]:
+            state = solver.run_inference(params, state, clamps, structure)
+        return state
+
+    def segments(self):
+        """Flatten component segments — nested schedules compose."""
+        flattened = []
+        for solver in self.config["solvers"]:
+            flattened.extend(solver.segments())
+        return tuple(flattened)
+
+    @classmethod
+    def inference_step(cls, params, state, clamps, structure, config):
+        raise NotImplementedError(
+            "InferenceSchedule has no single per-step rule; iterate "
+            "segments() and step each segment's own solver."
+        )
+
+
 # =============================================================================
 # Convenience Function
 # =============================================================================
@@ -862,8 +807,8 @@ def run_inference(
     Run inference using the algorithm object stored in the graph structure.
 
     Convenience wrapper that extracts the inference object from
-    ``structure.config["inference"]`` and delegates to its class's
-    static ``run_inference`` method.
+    ``structure.config["inference"]`` and delegates to its
+    ``run_inference`` method.
 
     Args:
         params: Graph parameters.
@@ -875,6 +820,4 @@ def run_inference(
         Converged graph state after inference.
     """
     inference_object = structure.config["inference"]
-    return type(inference_object).run_inference(
-        params, initial_state, clamps, structure
-    )
+    return inference_object.run_inference(params, initial_state, clamps, structure)

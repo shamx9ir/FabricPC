@@ -14,7 +14,7 @@ from fabricpc.core.inference import InferenceSGD, run_inference
 from fabricpc.core.activations import SigmoidActivation, SoftmaxActivation
 from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.initializers import XavierInitializer, NormalInitializer
-from fabricpc.training import train_step
+from fabricpc.training import make_train_step
 from conftest import with_inference
 import optax
 
@@ -100,6 +100,48 @@ class TestShapes:
 
 class TestEnergy:
     """Verify energy behavior during inference."""
+
+    def test_attractor_energy_formula(self, rng_key):
+        """Value-pin the attractor term: energy() minus the base PC term
+        equals s * (1/2D) z^T (W^2 - W) z computed independently, where W is
+        the prepared (symmetrized) weight matrix and s the effective
+        (softplus'd) strength."""
+        D = 8
+        structure = _build_hopfield_graph_1d(D=D)
+        params = initialize_params(structure, rng_key)
+        info = structure.nodes["hopfield"].node_info
+        hop_params = params.nodes["hopfield"]
+
+        batch_size = 3
+        probe = jax.random.normal(jax.random.PRNGKey(2), (batch_size, D))
+        inputs = {info.in_edges[0]: probe}
+        from fabricpc.core.types import NodeState
+
+        z = jax.random.normal(jax.random.PRNGKey(3), (batch_size, D))
+        state = NodeState(
+            z_latent=z,
+            z_mu=jnp.zeros((batch_size, D)),
+            error=jnp.zeros((batch_size, D)),
+            energy=jnp.zeros((batch_size,)),
+            latent_grad=jnp.zeros((batch_size, D)),
+        )
+        new_state, _ = StorkeyHopfield.forward_with_aux(hop_params, inputs, state, info)
+
+        energy_obj = info.energy
+        pc_term = type(energy_obj).energy(
+            new_state.z_latent, new_state.z_mu, energy_obj.config
+        )
+        edge_key = info.in_edges[0]
+        W = StorkeyHopfield._prepare_W(hop_params.weights[edge_key], info.node_config)
+        s = jax.nn.softplus(hop_params.biases["hopfield_strength"])
+        # (1/2D) z^T (W^2 - W) z, written as its quadratic forms.
+        expected_attractor = (0.5 / D) * (
+            jnp.einsum("bi,ij,jk,bk->b", z, W, W, z)
+            - jnp.einsum("bi,ij,bj->b", z, W, z)
+        )
+        assert jnp.allclose(
+            new_state.energy - pc_term, s * expected_attractor, atol=1e-5
+        )
 
     def test_energy_decreases_during_inference(self, rng_key):
         """Energy should decrease (or not increase) over more inference steps."""
@@ -326,15 +368,17 @@ class TestIntegration:
         y = jax.nn.one_hot(
             jax.random.randint(x_key, (batch_size,), 0, n_classes), n_classes
         )
-        batch = {"input": x, "class": y}
+        # Batch keys are TASK keys (x/y), not node names: a batch keyed by
+        # node names matches nothing in the task_map, produces zero clamps,
+        # and now raises instead of silently training unclamped.
+        batch = {"x": x, "y": y}
 
         optimizer = optax.adam(1e-3)
         opt_state = optimizer.init(params)
 
-        new_params, opt_state, energy, _ = train_step(
-            params, opt_state, batch, structure, optimizer, train_key
-        )
-        assert jnp.isfinite(energy)
+        step = make_train_step(structure, optimizer)
+        new_params, opt_state, metrics, _ = step(params, opt_state, batch, train_key)
+        assert jnp.isfinite(metrics["energy"])
         # Params should have changed
         edge_key = list(params.nodes["hopfield"].weights.keys())[0]
         assert not jnp.allclose(

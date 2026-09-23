@@ -32,7 +32,7 @@ from fabricpc.core.energy import GaussianEnergy, CrossEntropyEnergy
 from fabricpc.core.initializers import KaimingInitializer
 from fabricpc.core.inference import InferenceSGD
 import optax
-from fabricpc.training import evaluate_pcn
+from fabricpc.training import evaluate
 
 # Import dashboarding utilities
 from fabricpc.utils.dashboarding import (
@@ -138,6 +138,7 @@ if TRACKING_ENABLED:
         track_weight_distributions=True,
         track_state_distributions=True,
         nodes_to_track=["h1", "h2", "h3", "class"],
+        distribution_nodes=["h1", "h2", "h3", "class"],
         tracking_every_n_batches=50,
         state_tracking_every_n_infer_steps=5,
     )
@@ -206,7 +207,10 @@ for epoch in range(num_epochs):
             stacked_history, collect_every=INFERENCE_COLLECT_EVERY
         )
 
-        normalized_energy = float(energy) / batch_size
+        # train_step_with_history returns the training objective per
+        # prediction (graph_energy over in_degree>0 nodes / prediction count,
+        # = batch_size for MNIST) — no further normalization needed.
+        normalized_energy = float(energy)
         epoch_energies.append(normalized_energy)
 
         if tracker is not None:
@@ -268,7 +272,7 @@ for epoch in range(num_epochs):
         tracker.track_weight_distributions(params, structure, epoch=epoch, batch=0)
 
     epoch_eval_key, eval_key = jax.random.split(eval_key)
-    metrics = evaluate_pcn(params, structure, test_loader, train_config, epoch_eval_key)
+    metrics = evaluate(params, structure, test_loader, train_config, epoch_eval_key)
     accuracy = metrics["accuracy"] * 100
 
     if tracker is not None:

@@ -25,7 +25,7 @@ from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.core.initializers import XavierInitializer
 import optax
-from fabricpc.training import train_pcn, evaluate_pcn
+from fabricpc.training import train, evaluate
 from fabricpc.utils.data.dataloader import MnistLoader
 from fabricpc import setup_jax
 
@@ -83,7 +83,7 @@ test_loader = MnistLoader(
     "test", batch_size=batch_size, tensor_format="flat", shuffle=False
 )
 
-trained_params, energy_history, _ = train_pcn(
+result = train(
     params=params,
     structure=structure,
     train_loader=train_loader,
@@ -92,9 +92,10 @@ trained_params, energy_history, _ = train_pcn(
     rng_key=train_key,
     verbose=True,
 )
+trained_params = result.params
 
 # --- Step 5: Evaluate ---
-metrics = evaluate_pcn(trained_params, structure, test_loader, train_config, eval_key)
+metrics = evaluate(trained_params, structure, test_loader, train_config, eval_key)
 print(f"Test Accuracy: {metrics['accuracy'] * 100:.2f}%")
 ```
 
@@ -110,7 +111,7 @@ For each training batch, the network runs **inference** to minimize energy:
 4. Update latent states to reduce energy: `z_latent -= eta_infer * dE/dz`
 5. Repeat steps 2-4 for `infer_steps` iterations
 
-This is implemented by `InferenceSGD` with 20 inference steps per batch.
+This is implemented by `InferenceSGD` with 20 inference steps per batch. `InferenceSGD` is the state-based solver, whose rate acts one node at a time. Deep graphs use `EPCInference`, whose rate is a single global rate bounded by a quantity measured from your graph, so the rate above does not carry over; see [Training with ePC](17_training_with_epc.md) before using it.
 
 ### Outer Loop: Learning
 
@@ -132,3 +133,4 @@ The default energy is Gaussian: `E = 0.5 * ||z_latent - z_mu||^2`. The output no
 - [Building Models](04_building_models.md) — Learn about all node types and graph topologies
 - [Initialization and Scaling](05_initialization_and_scaling.md) — Weight init strategies and muPC scaling for deep networks
 - [Training and Evaluation](08_training_and_evaluation.md) — Callbacks, multi-GPU, and advanced training patterns
+- [Training with ePC](17_training_with_epc.md) — Measure your graph's rate bound, choose η and T from it, and track stability during training

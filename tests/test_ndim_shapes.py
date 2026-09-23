@@ -16,7 +16,7 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from fabricpc.core.inference import InferenceSGD
 import optax
-from fabricpc.training import train_step
+from fabricpc.training import make_train_step
 from fabricpc.core.activations import ReLUActivation, TanhActivation, SigmoidActivation
 from conftest import with_inference
 
@@ -61,7 +61,7 @@ class TestNDimShapes:
             structure, batch_size, rng_key, clamps=clamps, params=params
         )
         struct_mod = with_inference(structure, eta_infer=0.1, infer_steps=5)
-        final_state = type(struct_mod.config["inference"]).run_inference(
+        final_state = struct_mod.config["inference"].run_inference(
             params, state, clamps, struct_mod
         )
 
@@ -102,7 +102,7 @@ class TestNDimShapes:
             structure, batch_size, rng_key, clamps=clamps, params=params
         )
         struct_mod = with_inference(structure, eta_infer=0.1, infer_steps=5)
-        final_state = type(struct_mod.config["inference"]).run_inference(
+        final_state = struct_mod.config["inference"].run_inference(
             params, state, clamps, struct_mod
         )
 
@@ -149,7 +149,7 @@ class TestNDimShapes:
             structure, batch_size, rng_key, clamps=clamps, params=params
         )
         struct_mod = with_inference(structure, eta_infer=0.1, infer_steps=5)
-        final_state = type(struct_mod.config["inference"]).run_inference(
+        final_state = struct_mod.config["inference"].run_inference(
             params, state, clamps, struct_mod
         )
 
@@ -193,15 +193,12 @@ class TestNDimTraining:
             "y": jax.random.normal(rng_key, (batch_size, 10)),
         }
 
-        new_params, new_opt_state, energy, final_state = train_step(
-            params,
-            opt_state,
-            batch,
-            structure,
-            optimizer,
-            rng_key,
+        step = make_train_step(structure, optimizer)
+        new_params, new_opt_state, metrics, final_state = step(
+            params, opt_state, batch, rng_key
         )
 
+        energy = metrics["energy"]
         assert not jnp.isnan(energy)
         assert energy > 0
 

@@ -1,5 +1,247 @@
 # Changelog
 
+## [0.6.0] - 2026-09-14
+ePC error-parameterized predictive coding (`EPCInference`) arrives as a drop-in solver alongside composable ePC + sPC inference schedules and first-class cyclic graphs (`graph(..., unroll=U)`); start with `docs/user_guides/17_training_with_epc.md`.
+
+### Breaking changes
+- The custom-node contract splits `forward()` into `predict()` and `energy()`. A node now implements `predict(params, inputs, state, node_info) -> (z_mu, aux)` — the parameterized prediction plus an optional pytree of intermediates — and, only when it adds energy terms, overrides `energy(params, inputs, state, aux, node_info) -> (batch,)`. The error pair (`error = z_latent - z_mu` and its inverse `z_latent = z_mu + error`) and the assembly templates (`forward`, `forward_with_aux`, `forward_from_error`) are base-owned and no longer node code: one prediction pass now serves both the state-based solvers and the error-parameterized `EPCInference`, which derives `z_latent` from the relaxed error and cannot tolerate a node body that recomputes the pair itself. `NodeBase.energy_functional` is deleted; its body is the default `energy()`. Migration: delete the `error`/`_replace`/`energy_functional` tail from each `forward()` body, rename it `predict`, and return `(z_mu, aux)`; move any post-hoc energy patching into an `energy()` override. See `docs/user_guides/06_custom_nodes.md`.
+- Unclamped readout nodes (`out_degree == 0`, no clamp) are no longer forced to `error = 0`, `energy = 0` with `z_latent` overwritten by `z_mu` during inference: they take the ordinary relaxation path, so energy terms a readout assigns (a StorkeyHopfield readout's attractor term) survive and the readout settles like any other node. Eval accuracy is unchanged — every eval path reads predictions from `z_mu` (`evaluate_transformer` previously read `z_latent`, which the old forcing made equal to `z_mu`, and is migrated). Reported eval energy now includes readout energy that was previously zeroed.
+- Inference-solver methods dispatch on the class: `InferenceBase.run_inference` is an instance method and the computation methods (`inference_step`, `forward_value_and_grad`, `update_latents`) are classmethods, no longer reading `structure.config["inference"]` for dispatch. Call `inference.run_inference(params, state, clamps, structure)`; the old static-call form `type(inference).run_inference(params, ...)` binds `params` as `self` and breaks.
+- Cyclic graphs require an explicit `graph(..., unroll=U)`; construction raises `GraphCycleError` instead of printing a warning and silently dropping cycle members (and everything downstream) from the topological order. `GraphStructure` gains a `schedule` field — the full visit schedule at the chosen unroll degree — walked by feedforward initialization and ePC state derivation; `node_order` is its first-occurrence deduplication.
+
+### New
+- `EPCInference` — error-parameterized predictive coding (Goemaere et al., arXiv 2505.20137). The prediction errors ε are the relaxed variables; each step takes one global reverse pass through the derived forward (`z_latent = z_mu + ε` along `structure.schedule`), so a few steps replace sPC's hundreds on deep graphs. `begin_segment` resyncs ε := z_latent − z_mu at the carried latents, so ePC continues exactly from any incoming state; `finalize_state` rebuilds a self-consistent state for the unchanged local weight-gradient path. One step from ε = 0 leaves ε at −eta_infer times the backprop activation gradient, so ePC is backprop with rescaled gradients whenever eta_infer × infer_steps × λ ≪ 1 on the error modes that carry the starting gradient, λ an eigenvalue of the energy's Hessian in error coordinates (the gradient-weighted relaxed fraction f̄ ≪ 0.1); f̄ > 0.9 is the PC equilibrium; eta_infer × λ_max < 2 is required for stability at every step count, and at odd step counts the output-layer weight gradient reverses sign once eta_infer × (λ_max − 1) > 1. `EPCInference.regime(spectrum) -> Regime` carries the verdict (`unstable`, `output_gradient_reverses`, `f_weighted`, `f_max`, `band`, `negative_weight`, `growth_min`). See `docs/user_guides/12_api_inference.md`; the measured regime and stability of the ResNet-18 demo are in `docs/reports/epc_regime_and_stability_report.md`.
+- `fabricpc.core.epsilon_spectrum` — `epsilon_spectrum` / `make_epsilon_spectrum`, a Lanczos estimate of the excited spectrum of the error Hessian on any graph through `EPCInference.error_energy` (Hessian-vector products only, three vectors of ε size): `lambda_max` (the stability bound 2/λ_max), `lambda_min` (negative means indefinite), the Ritz values with the fraction of the starting gradient each carries, `negative_weight`, and the Ritz residuals; `weighted_relaxed_fraction` is f̄. A relative breakdown guard and an eps weight floor keep unexcited modes out of the extremes.
+- `fabricpc.training.RegimeProbe` — a `train` callback (`iter_callback=probe.on_iter`, `probe.on_epoch(ctx, accuracy)`) that records the excited spectrum, the `Regime` flags, and the Frobenius norm of every weight every N updates on a fixed probe batch or the training batch, plus the test accuracy per epoch, to a CSV with η, T, and the trainer in its columns (`read_regime_csv` reads it back); `first_reversal`, `first_crossing`, `first_chance`, `growth_phases`, `summary`. Works under `algorithm="backprop"` as the control (spectrum and norms, no regime). Supplying `iter_callback` forces a device sync every batch.
+- `fabricpc.utils.linear_pc_oracle` — exact equilibria of linear-Gaussian DAGs from params alone (least squares on the energy's quadratic form; the Innocenti et al. 2024 Theorem 1 closed form on chains, extended to precisions and biases), the latent and error Hessians, the stability bound 2/λ_max (raises when λ_max ≤ 0), excited spectra with `gradient_weights` and the exact `weighted_relaxed_fraction`, and per-mode relaxed fractions; NumPy only. `tests/test_linear_pc_oracle.py` checks `EPCInference` and `InferenceSGD` (muPC included) against the oracle, pins both stability bounds on the plain and the muPC chain, and checks the Lanczos extremes and f̄ against the oracle in float32 and float64.
+- `EPCInference.error_energy` — the ε-energy closure and the current errors, one owner for the solver's gradient, Hessian-vector products, and the Lanczos estimator. `tests/test_inference_epc.py::TestBackpropCorrespondence` pins the ε identity at zero, the one-step errors, and first-order weight-gradient parity with backprop at the fixture's measured λ_max; `TestRegime` pins the bands, the reversal, and the indefiniteness precedence on constructed spectra.
+- `scripts/epc_analysis.py` — the backprop regime (gradients through the trainer's per-prediction normalization), equilibrium energy profiles with the Theorem 1 damping ‖r S⁻¹‖/‖r‖ per depth and init, convergence spectra, and stability (Lanczos against the oracle's excited extremes and f̄) on linear graphs (CPU, under a minute); `--resnet18` measures the spectrum at init on the demo and prints f̄ per recorded sweep cell; `--plot_track` renders `RegimeProbe` CSVs. `examples/resnet18_cifar10_demo.py --track_regime N` records the spectrum during training; the demo docstring lists the four control runs, analysed in the report's Section 5.9.
+- `InferenceSchedule` — composable per-update solver segments (e.g. a few global ePC steps warm-starting sPC refinement); nested schedules flatten via `segments()`.
+- `InferenceBase` segment hooks `begin_segment`/`finalize_state` and `segments()`; the tracking variants (`run_inference_with_history`, `make_inference_history`) iterate segments inside one jitted program, so composed schedules are tracked segment by segment, and every state `make_inference_history` samples is passed through the segment solver's `finalize_state`, so an ePC sample is the derived state `run_inference` would return at that step count. `make_tracked_probe(structure)` is the per-step-metrics twin of `make_tracked_settle`: a jitted `(params, key, clamps) -> (final_state, stacked_metrics)` that compiles latent initialization and `run_inference_with_history` into one program, for probing a fixed batch from `train`'s iteration callback or across checkpoints.
+- `graph(..., unroll=U)` — first-class cyclic graphs: `GraphStructure.schedule` holds the visit schedule at unroll degree U, walked by feedforward initialization and ePC state derivation (see the breaking-changes entry).
+- ePC vs sPC benchmark on ResNet-18/CIFAR-10: `examples/epc_spc_resnet18_compare.py` (trained-accuracy/wall-clock sweep and single-batch convergence modes).
+
+## [0.5.2] - 2026-09-08
+
+Per-batch diagnostics run as `train` callbacks instead of custom training
+loops. `iter_callback` now receives one `IterContext` carrying the parameters,
+optimizer state, the batch, its RNG key, and the step's `GraphState`.
+The dashboarding callbacks run on `train`.
+
+### Migration table
+
+| Changed | Replacement |
+|---|---|
+| `iter_callback(epoch_idx, batch_idx, metrics)` | `iter_callback(ctx: IterContext)`; read `ctx.epoch_idx`, `ctx.batch_idx`, `ctx.metrics` |
+| `create_detailed_iter_callback` in a custom loop | `train(..., iter_callback=create_iter_callback(tracker))` with `TrackingConfig(track_state=True, distribution_nodes=[...])` |
+| Weight histograms logged once per epoch for every node | logged every `tracking_every_n_batches` for `distribution_nodes` only. Set it, or no weight or state distributions are logged |
+| `run_inference_with_full_history` | `make_inference_history(structure, every=k)`, jitted |
+| Hand-built `EpochContext(...)` | add `algorithm` and `epoch_key` |
+
+### New
+
+- `IterContext`: superset of the `EpochContext` fields, then `batch_idx`, `state`,
+  `batch_key`, `batch`. `EpochContext` gains `algorithm` and `epoch_key`.
+  New fields are appended; existing positions do not move.
+- `TrackingConfig.distribution_nodes`: the nodes whose weight and state
+  distributions are logged. Empty logs none, as an empty `nodes_to_track`
+  logs no per-node energy.
+- `TrackingConfig.track_state`: state summary statistics on tracked batches;
+  `track_state_distributions` implies it. Under PC the callback re-settles
+  the tracked batch under the updated parameters in one jitted program and
+  logs the state after `0, k, 2k, ...` inference steps
+  (`k = state_tracking_every_n_infer_steps`), the last being the settled
+  state. Under backprop it logs the feedforward state once.
+- `make_inference_history` and `make_tracked_settle` in
+  `fabricpc.utils.dashboarding`: the jitted re-settle, usable from custom
+  loops.
+- `BayesianTuner` passes its progress callback only when `verbose=True`.
+
+## [0.5.1] - 2026-09-07
+
+Gradients reaching optax are now means per prediction under both algorithms.
+The trainer divides the batch-summed PC weight gradients and the backprop
+objective once by one global prediction count N: the total number of
+clamped-target prediction positions in the batch (`batch` for classification,
+`batch * seq_len` for token targets, summed over target heads, `batch` when the
+graph has no clamped target). One learning rate, clipping threshold, or Adam
+epsilon now means the same under `algorithm="pc"` and `"backprop"` and across
+batch sizes and sequence lengths. For rank-2 (classification) targets every
+reported number is unchanged; for sequence targets the PC `energy` metric moves
+from per sample to per token.
+
+### Migration table
+
+| Changed | Replacement |
+|---|---|
+| `compute_local_weight_gradients` fed directly to an optimizer in a custom loop (batch-summed gradients) | `pc_weight_gradients(params, state, structure, clamps)` — the same gradients divided by `grad_denominator(structure, clamps)` |
+| SGD-family learning rates tuned on summed PC gradients | multiply `lr` by N and divide a coupled `add_decayed_weights` rate by N (Adam/AdamW rates are unchanged) |
+| Training `energy` metric read as "per sample" | per prediction, on the same scale as `target_energy`; the node set is still algorithm-dependent |
+| `scale_by_natural_gradient_diag` / `scale_by_natural_gradient_layerwise` optimizer states saved under 0.5.0 | do not restore: both states gained a `count` field for the Fisher EMA's bias correction |
+
+### New
+
+- `fabricpc.training.grad_denominator(structure, clamps) -> int`,
+  `fabricpc.training.pc_weight_gradients(params, state, structure, clamps)`,
+  and `fabricpc.training.batch_size_of(batch, structure)`.
+- Natural-gradient transforms: bias-corrected Fisher EMA (the states gain a
+  `count` field) and a `damping` default of 1e-8, chosen on the
+  MNIST demo at the per-prediction gradient scale. The module docstring
+  states the two regimes the transforms have (SGD with rate
+  `scale / damping` where the damping dominates, about `1 / g` where the
+  Fisher does) and why no damping value yields a natural-gradient step; the
+  estimator redesign is tracked in
+  https://github.com/trueagi-io/FabricPC/issues/68.
+- `evaluate`'s default PC `energy` metric weights each sample by its
+  prediction count, so it reports internal energy per prediction and agrees
+  with the training `energy`.
+- `train_step_with_history` (dashboarding) reads the batch size from the
+  task-mapped keys and normalizes like the trainer; a parity test pins it to
+  `make_train_step`.
+- `examples/mnist_advanced.py` gains `--num_epochs`; its `sgd` preset is
+  rescaled exactly (`lr` 0.01 -> 2.0, weight decay 0.1 -> 5e-4 at N = 200)
+  and the two natural-gradient presets use constants swept on the
+  per-prediction scale.
+
+## [0.5.0] - 2026-08-30
+One trainer replaces the four training harnesses. `train`/`evaluate` serve both
+learning algorithms, selected by `algorithm="pc"|"backprop"`; backprop is framed
+in energy (its objective is the clamped target node's energy, so the output
+node's energy functional selects the loss), causal masking and target one-hot
+encoding are derived from the graph and target dtype, training is resumable
+(`opt_state`/`start_epoch`), and multi-device data parallelism runs on jit +
+`NamedSharding` meshes instead of pmap. Clean break: the legacy names are
+removed, not deprecated.
+
+### Migration table
+
+| Removed | Replacement |
+|---|---|
+| `train_pcn` | `train` (returns `TrainResult`; use `result.params`) |
+| `evaluate_pcn` | `evaluate` |
+| `train_backprop` | `train(..., algorithm="backprop")` |
+| `evaluate_backprop` | `evaluate(..., algorithm="backprop")` |
+| `train_autoregressive` | `train` (mask graph-derived, one-hot dtype-derived) |
+| `evaluate_autoregressive` | `evaluate` |
+| `train_backprop_autoregressive` | `train(..., algorithm="backprop")` |
+| `evaluate_backprop_autoregressive` | `evaluate(..., algorithm="backprop")` |
+| `evaluate_transformer` | `evaluate` |
+| `generate_autoregressive` | `generate` (same sampling parameters) |
+| `train_step` | `make_train_step(structure, optimizer)` -> `step(params, opt_state, batch, rng_key)` |
+| `train_step_backprop`, `train_step_autoregressive`, `train_step_backprop_autoregressive` | `make_train_step(..., algorithm=...)` |
+| `train_step_pmap`, `create_pmap_train_step` | `make_train_step(..., mesh=...)` |
+| `get_graph_param_gradient` | compose `build_clamps` + `initialize_graph_state` + `run_inference` + `compute_local_weight_gradients` |
+| `build_train_clamps` | `build_clamps(batch, structure, clamp_target=True)` |
+| `causal_mask_clamps` | `build_clamps` (injected when the `TaskMap` declares `causal_mask`) |
+| `compute_loss`, `compute_loss_autoregressive`, `compute_forward_pass` | the output node's energy functional + `graph_energy` |
+| `replicate_params`, `replicate_opt_state`, `shard_batch`, `unshard_energies` | not needed: pass `mesh=jax.make_mesh((jax.device_count(),), ("data",))` |
+| `train_pcn_multi_gpu`, `evaluate_pcn_multi_gpu`, `evaluate_transformer_multi_gpu`, `fabricpc.training.multi_gpu` | `train`/`evaluate` with `mesh=` |
+| `pmap_single_device=`, `use_tqdm=` | removed (`verbose` controls tqdm; test meshes via `XLA_FLAGS=--xla_force_host_platform_device_count=2`) |
+| `config["loss_type"]` | removed — raises `ValueError`; set the output node's energy functional |
+| `config["use_causal_mask"]` | removed — raises `ValueError`; the mask follows the graph |
+| `autoregressive=` (never released) | removed — mask graph-derived, one-hot dtype-derived |
+| `iter_callback(epoch_idx, batch_idx, energy: float)` | `iter_callback(epoch_idx, batch_idx, metrics: dict)` — read `metrics["energy"]`; formatting the third argument directly (`f"{energy:.4f}"`) now raises `TypeError` |
+| `epoch_callback(epoch_idx, params, structure, config, rng_key)` — five positionals | `epoch_callback(ctx: EpochContext)` — one context argument, fields by name |
+| `evaluate_backprop(..., rng_key=None)` (defaulted to `PRNGKey(0)`) | `evaluate` — `rng_key` is a required positional |
+| `create_detailed_iter_callback` (dashboarding) `(epoch_idx, batch_idx, energy: float, final_state)` | `(epoch_idx, batch_idx, metrics: dict, final_state)`, for custom loops over `make_train_step` |
+
+### New
+
+- `train(...) -> TrainResult(params, opt_state, step, iter_results, epoch_results)`,
+  with `opt_state=` and `start_epoch=` for resume: optimizer moments and optax
+  schedule counts survive a save/load boundary, and the fold_in RNG stream makes
+  an interrupted run bitwise-equal to the uninterrupted one.
+- `epoch_callback(ctx: EpochContext)` — one context argument (`epoch_idx`,
+  `step`, `params`, `opt_state`, `structure`, `config`, `rng_key`, `metrics`)
+  that grows by field addition. Callback exceptions propagate (tested; tuner
+  pruning depends on it); a non-None return replaces the stored history entry.
+- Pluggable eval metrics: `evaluate(..., metrics=)` takes named
+  `EvalMetric(fn, finalize)` entries with a per-sample `(value, weight)`
+  contract and weighted aggregation `finalize(Σvalue/Σweight)`; `None` selects
+  graph-derived defaults (`target_energy`, `accuracy`; + `cross_entropy`,
+  `perplexity` for `CrossEntropyEnergy` targets; + `energy` for PC).
+- `graph_energy(state, structure, node_names=None)` in `fabricpc.core.energy`:
+  the one graph-level energy sum (default: all `in_degree>0` nodes, order fixed
+  by the structure).
+- `make_train_step(structure, optimizer, algorithm=, mesh=)` — the public
+  jitted step for custom loops; returns `(params, opt_state, metrics,
+  final_state)` and does not donate its inputs.
+- Non-float targets: int **and bool** class/token targets are one-hot encoded
+  from their dtype (class count from the target node's `shape[-1]`); stock
+  int32 token loaders now work with backprop training too.
+- Backprop training gains tqdm progress and multi-device data parallelism.
+- `generate(..., algorithm=)` with the same validation as `train`/`evaluate`:
+  `"pc"` (default) settles via `run_inference`, `"backprop"` samples from the
+  feedforward pass — required for graphs built with `inference=None`, which
+  previously crashed inside `run_inference` with an opaque `AttributeError`.
+- `BayesianTuner(algorithm=)` threads the learning algorithm through every
+  trial's `train`/`evaluate` (previously fixed to PC), and raises instead of
+  silently scoring `inf` when the trial graph has no `CrossEntropyEnergy`
+  target (no `perplexity` key to minimize).
+- Fail-fast diagnostics: a wrong-shape target raises an actionable
+  `ValueError` from `build_clamps` (was an opaque XLA broadcast error), a
+  loader without `len()` and a mesh without a `"data"` axis raise messages
+  naming the requirement, and the causal-mask sequence length is read from
+  the mask node's declared shape instead of a hard-coded `batch["x"]`.
+
+### Behavior changes
+
+- Multi-device PC weight gradients are now the global batch sum, matching the
+  single-device semantics (pinned by the mesh-vs-single-device parity tests).
+  The 0.4 pmap path applied a device mean (`pmean`) over per-device shard
+  sums, so its gradients were smaller by the device count N for the same
+  global batch. To reproduce 0.4 multi-GPU runs with a scale-sensitive
+  optimizer (SGD), divide the learning rate by N; Adam-family updates are
+  invariant to the gradient scale up to `eps`, so Adam runs shift only
+  marginally.
+- `config["num_epochs"]` is required by `train`; the legacy silent default of
+  10 epochs is removed (a missing key now raises `ValueError`). A fractional
+  tail that rounds to zero batches is dropped instead of producing an empty
+  epoch entry.
+- `evaluate` on an empty loader returns `NaN` for each metric (was `0.0`).
+- The default eval metrics raise `ValueError` on a graph with no target task
+  key (`evaluate_pcn` silently returned `{"energy": ..., "accuracy": 0.0}`);
+  pass an explicit `metrics=` dict to evaluate such a graph.
+- Eval result keys: `loss` is renamed `cross_entropy`; `target_energy` is new;
+  `cross_entropy`/`perplexity` are reported only for `CrossEntropyEnergy`
+  targets (previously a finite-but-meaningless cross-entropy could be reported
+  on Gaussian outputs); `num_batches` and `debug=` are dropped. Eval `energy`
+  (PC) now sums internal (`in_degree>0`) nodes only, matching the training
+  objective (the legacy all-node sum differed only by `E(z,z)` terms on
+  terminal nodes, zero under `GaussianEnergy`).
+- Accuracy argmaxes on `axis=-1` (the legacy hard-coded `axis=1` mis-reduced
+  rank>2 outputs).
+- AR-backprop objective is per-sample (sum over sequence positions ÷ batch),
+  not the legacy per-token mean: the effective learning rate shifts by
+  `×seq_len`; divide legacy learning rates by `seq_len` to reproduce.
+- Gaussian-output backprop objective is `0.5·precision·SSE` per sample, not an
+  element-mean MSE.
+- Cross-entropy numerics: the output functional clips `clip(mu, 1e-7, 1)`
+  (the legacy loss used `log(mu + 1e-10)`).
+- Transformer evaluation fixes: the legacy eval applied a softmax to
+  `z_latent`, which for a free output already holds post-softmax probabilities
+  (a double softmax), and added an external squared-error term to energy; the
+  unified evaluate reads `z_mu` directly and reports pure internal energy.
+  Pre-0.5 transformer eval numbers are not reproducible.
+- RNG stream: keys derive as `fold_in(base_key, epoch_idx)` →
+  `fold_in(epoch_key, batch_idx)` (loader-length-independent, resumable);
+  0.4 training runs are not bitwise reproducible under 0.5.
+- `evaluate` clamps all non-target task keys (legacy clamped only `x`);
+  affects only multi-input eval batches, which no shipped code uses.
+- `train_step_with_history` (dashboarding) reports per-sample internal energy
+  (was an unnormalized all-node sum).
+- Training metrics are per-batch dicts `{"energy", "target_energy"}` held as
+  device scalars and materialized at epoch boundaries; a supplied
+  `iter_callback` (or tqdm under `verbose`) forces the per-batch sync.
+- The `BayesianTuner` reports train perplexity `exp(target_energy)` to Optuna
+  and logs the validation `cross_entropy`; its training-energy diagnostic is
+  keyed `train_energy`.
+
+### Packaging
+
+- `flax` removed from the dependencies — nothing imports it (the checkpointing
+  follow-up uses Orbax).
+
 ## [0.4.0] - 2026-08-19
 First release published to PyPI: `pip install fabricpc`. Also a muPC scaling correctness release — deep residual and pooling graphs previously trained with an attenuated signal; activations, losses, and tuned learning rates will shift. See `docs/user_guides/05_initialization_and_scaling.md`.
 

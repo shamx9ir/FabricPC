@@ -6,12 +6,22 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
 os.environ.setdefault("JAX_TRACEBACK_FILTERING", "off")
 
-import pytest
+from typing import Iterator
+
 import jax
+import jax.numpy as jnp
+import pytest
 
 from fabricpc import setup_jax
+from fabricpc.core.activations import SigmoidActivation, SoftmaxActivation
+from fabricpc.core.energy import CrossEntropyEnergy
 from fabricpc.core.inference import InferenceSGD
+from fabricpc.core.topology import Edge
+from fabricpc.graph_assembly import TaskMap, graph
+from fabricpc.nodes import Linear
 
+# Binds at backend initialization (the first JAX computation), so it may follow
+# the imports; none of them initialize the backend.
 setup_jax("cpu")
 
 
@@ -21,8 +31,91 @@ def rng_key():
     return jax.random.PRNGKey(42)
 
 
-def with_inference(structure, **kwargs):
-    """Return structure with modified inference config for testing."""
+def total_energy(state, structure):
+    """Total energy over in_degree > 0 nodes (the set the training loop sums)."""
+    return sum(
+        jnp.sum(state.nodes[name].energy)
+        for name in structure.nodes
+        if structure.nodes[name].node_info.in_degree > 0
+    )
+
+
+def with_inference(structure, inference=None, **kwargs):
+    """Return structure with modified inference config for testing.
+
+    Pass an ``InferenceBase`` object via ``inference``, or keyword arguments
+    to construct an ``InferenceSGD``.
+    """
     new_config = dict(structure.config)
-    new_config["inference"] = InferenceSGD(**kwargs)
+    new_config["inference"] = (
+        inference if inference is not None else InferenceSGD(**kwargs)
+    )
     return structure._replace(config=new_config)
+
+
+class ListLoader:
+    """Deterministic loader: same batches every time it is iterated."""
+
+    def __init__(self, batches):
+        self._batches = batches
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def __iter__(self) -> Iterator:
+        return iter(self._batches)
+
+
+def max_param_diff(a, b) -> float:
+    """Max absolute elementwise difference across two GraphParams pytrees."""
+    diffs = jax.tree_util.tree_map(lambda p, q: jnp.max(jnp.abs(p - q)), a, b)
+    return float(jax.tree_util.tree_reduce(jnp.maximum, diffs, jnp.array(0.0)))
+
+
+def make_classification_structure(
+    output_energy=None, output_activation=None, state_initializer=None
+):
+    """3-node Linear chain x(6) -> h(8, sigmoid) -> y(3, softmax + CE).
+
+    The default FeedforwardStateInit satisfies both algorithms and
+    InferenceSGD drives PC settling; pass ``state_initializer`` (e.g.
+    ``GlobalStateInit()``) for RNG-sensitive latent initialization.
+    """
+    x = Linear(shape=(6,), name="x")
+    h = Linear(shape=(8,), activation=SigmoidActivation(), name="h")
+    y = Linear(
+        shape=(3,),
+        activation=output_activation or SoftmaxActivation(),
+        energy=output_energy or CrossEntropyEnergy(),
+        name="y",
+    )
+    return graph(
+        nodes=[x, h, y],
+        edges=[
+            Edge(source=x, target=h.slot("in")),
+            Edge(source=h, target=y.slot("in")),
+        ],
+        task_map=TaskMap(x=x, y=y),
+        inference=InferenceSGD(eta_infer=0.05, infer_steps=10),
+        graph_state_initializer=state_initializer,
+    )
+
+
+def inject_biases(params, key, std=0.5):
+    """Return ``params`` with every ``"b"`` bias drawn from N(0, std²).
+
+    ``Linear.initialize_params`` zero-fills biases (``nodes/linear.py:191``),
+    so ``use_bias=True`` alone exercises no bias path; tests that need
+    nonzero biases draw them here.
+    """
+    from fabricpc.core.types import GraphParams, NodeParams
+
+    nodes = {}
+    for i, (name, node_params) in enumerate(params.nodes.items()):
+        biases = dict(node_params.biases)
+        if "b" in biases and biases["b"].size > 0:
+            biases["b"] = std * jax.random.normal(
+                jax.random.fold_in(key, i), biases["b"].shape
+            )
+        nodes[name] = NodeParams(weights=node_params.weights, biases=biases)
+    return GraphParams(nodes=nodes)
