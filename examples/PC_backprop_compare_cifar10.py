@@ -184,7 +184,15 @@ def _make_residual_block(prev_node, channels, stride, block_name, weight_init, a
     return nodes, edges, skip_sum
 
 
-def build_mini_resnet(activation, *, infer_steps=50, eta_infer=0.1, alpha=1.0, rho=1.0):
+def build_mini_resnet(
+    activation,
+    *,
+    infer_steps=50,
+    eta_infer=0.1,
+    alpha=1.0,
+    rho=1.0,
+    weight_credit_timing="pre_dual_energy",
+):
     """Build a mini-ResNet for CIFAR-10 (stem + 3 residual blocks).
 
     Architecture::
@@ -206,6 +214,9 @@ def build_mini_resnet(activation, *, infer_steps=50, eta_infer=0.1, alpha=1.0, r
         eta_infer: Inference step size (ignored by backprop).
         alpha: ALM dual step size (default: 1.0).
         rho: ALM penalty strength (default: 1.0).
+        weight_credit_timing: When to snapshot duals for weight gradients.
+            "pre_dual_energy" (default) — duals from the last primal step.
+            "post_dual_energy" — one extra dual update after the final primal.
 
     Returns:
         GraphStructure ready for initialize_params().
@@ -264,12 +275,21 @@ def build_mini_resnet(activation, *, infer_steps=50, eta_infer=0.1, alpha=1.0, r
         inference=InferenceALM(
             eta_infer=eta_infer, infer_steps=infer_steps,
             alpha=alpha, rho=rho,
+            weight_credit_timing=weight_credit_timing,
         ),
     )
     return structure
 
 
-def create_alm_model(rng_key, *, infer_steps=50, eta_infer=0.1, alpha=1.0, rho=1.0):
+def create_alm_model(
+    rng_key,
+    *,
+    infer_steps=50,
+    eta_infer=0.1,
+    alpha=1.0,
+    rho=1.0,
+    weight_credit_timing="pre_dual_energy",
+):
     """PC-ALM model — tanh activations for stable iterative inference.
 
     Tanh is bounded and has non-zero gradients everywhere, which prevents
@@ -277,13 +297,21 @@ def create_alm_model(rng_key, *, infer_steps=50, eta_infer=0.1, alpha=1.0, rho=1
     """
     structure = build_mini_resnet(
         TanhActivation(), infer_steps=infer_steps, eta_infer=eta_infer,
-        alpha=alpha, rho=rho,
+        alpha=alpha, rho=rho, weight_credit_timing=weight_credit_timing,
     )
     params = initialize_params(structure, rng_key)
     return params, structure
 
 
-def create_backprop_model(rng_key, *, infer_steps=50, eta_infer=0.1, alpha=1.0, rho=1.0):
+def create_backprop_model(
+    rng_key,
+    *,
+    infer_steps=50,
+    eta_infer=0.1,
+    alpha=1.0,
+    rho=1.0,
+    weight_credit_timing="pre_dual_energy",
+):
     """Backprop model — ReLU activations (standard for end-to-end training).
 
     ReLU avoids the vanishing-gradient problem that tanh can introduce when
@@ -291,7 +319,7 @@ def create_backprop_model(rng_key, *, infer_steps=50, eta_infer=0.1, alpha=1.0, 
     """
     structure = build_mini_resnet(
         ReLUActivation(), infer_steps=infer_steps, eta_infer=eta_infer,
-        alpha=alpha, rho=rho,
+        alpha=alpha, rho=rho, weight_credit_timing=weight_credit_timing,
     )
     params = initialize_params(structure, rng_key)
     return params, structure
@@ -361,6 +389,15 @@ def parse_args():
         help="ALM penalty strength — should match energy precision (default: 1.0)",
     )
     parser.add_argument(
+        "--weight_credit_timing",
+        type=str,
+        default="pre_dual_energy",
+        choices=["pre_dual_energy", "post_dual_energy"],
+        help="When to snapshot duals for weight gradients: "
+        "'pre_dual_energy' uses duals from the last primal step, "
+        "'post_dual_energy' adds one extra dual update (default: pre_dual_energy)",
+    )
+    parser.add_argument(
         "--augment",
         action="store_true",
         help="Enable data augmentation (random crop + horizontal flip)",
@@ -396,6 +433,7 @@ def main():
     print("ALM activations: tanh | Backprop activations: relu")
     print(f"Inference steps: {args.infer_steps}  |  eta_infer: {args.eta_infer}")
     print(f"ALM alpha: {args.alpha}  |  ALM rho: {args.rho}")
+    print(f"Weight credit timing: {args.weight_credit_timing}")
     print(
         f"Epochs: {args.num_epochs}  |  Batch size: {args.batch_size}"
         f"  |  LR: {args.lr}  |  Augment: {args.augment}"
@@ -408,12 +446,14 @@ def main():
     eta_infer = args.eta_infer
     alpha = args.alpha
     rho = args.rho
+    weight_credit_timing = args.weight_credit_timing
 
     arm_alm = ExperimentArm(
         name="ALM",
         model_factory=lambda rng: create_alm_model(
             rng, infer_steps=infer_steps, eta_infer=eta_infer,
             alpha=alpha, rho=rho,
+            weight_credit_timing=weight_credit_timing,
         ),
         train_fn=train_pcn,
         eval_fn=evaluate_pcn,
@@ -426,6 +466,7 @@ def main():
         model_factory=lambda rng: create_backprop_model(
             rng, infer_steps=infer_steps, eta_infer=eta_infer,
             alpha=alpha, rho=rho,
+            weight_credit_timing=weight_credit_timing,
         ),
         train_fn=train_backprop,
         eval_fn=evaluate_backprop,

@@ -88,6 +88,7 @@ Usage:
 
 import math
 import warnings
+from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
@@ -175,6 +176,172 @@ class MuPCConfig:
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+
+@dataclass(frozen=True)
+class PCALMScaling:
+    """
+    Scaling config matching the PC-ALM reference implementation's fixed
+    ``gamma0=1`` parameterization (Seely & Gould, arXiv:2605.31022).
+
+    For a residual MLP with ``depth`` total layers (first layer + hidden
+    layers + output layer), the per-layer forward scaling factors are:
+
+      - Layer 0 (first):  ``1 / sqrt(input_dim)``
+      - Hidden layers:     ``1 / sqrt(width * depth)``
+      - Output layer:      ``1 / width``
+
+    where ``input_dim`` is the feature dimension of the source node feeding
+    the first layer, ``width`` is the hidden dimension, and ``depth`` is the
+    total number of weight-bearing layers.
+
+    These factors are applied to all variance-scalable in-edges at each
+    node. Gradient and weight scaling factors are set to 1.0 (the
+    reference implementation handles gradient scaling via the optimizer's
+    learning rate formula).
+
+    Pass this as the ``scaling`` argument to the ``graph()`` builder
+    instead of ``MuPCConfig`` to reproduce the paper's exact
+    parameterization.
+
+    Args:
+        depth: Total number of weight-bearing layers (number of LinearPreAct
+            nodes). Must be >= 2.
+    """
+
+    depth: int
+
+    def __post_init__(self):
+        if self.depth < 2:
+            raise ValueError(
+                "PCALMScaling.depth must be at least 2 (one hidden + one output); "
+                f"got {self.depth}"
+            )
+
+
+def compute_pcalm_scalings(
+    nodes: Dict[str, Any],
+    edges: Dict[str, Any],
+    config: PCALMScaling,
+    node_order: Optional[List[str]] = None,
+) -> Dict[str, MuPCScalingFactors]:
+    """
+    Compute per-node MuPCScalingFactors matching the PC-ALM reference's
+    ``model_scales(width, depth, input_dim)`` formula.
+
+    The node graph must be a sequential chain (each internal node has
+    exactly one variance-scalable in-edge). Nodes are ordered by
+    ``node_order``; terminal input nodes (in_degree=0) are skipped.
+
+    Scaling assignment (matching ``pcalm.model.model_scales``):
+      - First internal node: ``1 / sqrt(input_dim)``
+      - Intermediate internal nodes: ``1 / sqrt(width * depth)``
+      - Last internal node (output): ``1 / width``
+
+    ``input_dim`` is inferred from the source node's shape (its last dim
+    or its flat product when flatten_input is set); ``width`` is
+    inferred from the first internal node's ``in`` slot source shape.
+    ``depth`` comes from the config.
+
+    Returns:
+        Dictionary mapping node names to MuPCScalingFactors instances.
+        Terminal input nodes get None.
+    """
+    iteration_order = node_order if node_order is not None else list(nodes.keys())
+    depth = config.depth
+
+    # Find the internal (weight-bearing) nodes in topological order
+    internal_nodes = [
+        name for name in iteration_order
+        if nodes[name].node_info.in_degree > 0
+    ]
+
+    if len(internal_nodes) != depth:
+        warnings.warn(
+            f"PCALMScaling.depth={depth} but the graph has "
+            f"{len(internal_nodes)} internal (weight-bearing) nodes. "
+            f"Using graph count ({len(internal_nodes)}) for consistent scaling.",
+            stacklevel=2,
+        )
+        depth = len(internal_nodes)
+
+    scalings: Dict[str, Optional[MuPCScalingFactors]] = {}
+
+    for node_name in iteration_order:
+        node = nodes[node_name]
+        node_info = node.node_info
+
+        if node_info.in_degree == 0:
+            scalings[node_name] = None
+            continue
+
+        layer_ix = internal_nodes.index(node_name)
+
+        # Find variance-scalable in-edges to compute the scale
+        scalable_edges = []
+        for edge_key in node_info.in_edges:
+            edge_info = edges[edge_key]
+            slot_info = node_info.slots[edge_info.slot]
+            if slot_info.is_variance_scalable:
+                scalable_edges.append(edge_key)
+
+        if not scalable_edges:
+            scalings[node_name] = None
+            continue
+
+        # Determine input_dim from the source of the first scalable edge
+        first_edge = edges[scalable_edges[0]]
+        source_shape = nodes[first_edge.source].node_info.shape
+        node_config = node_info.node_config
+        if node_config.get("flatten_input", False):
+            import numpy as np
+            input_dim = int(np.prod(source_shape))
+        else:
+            input_dim = source_shape[-1]
+
+        # Width = input_dim of the hidden layers (use the first internal
+        # node's source dim as proxy, but more precisely it's the source
+        # feature dim of non-first, non-last internal nodes).
+        # For the pc-alm formula we need the hidden width. Infer it from
+        # the second internal node's input dim, falling back to the first.
+        if len(internal_nodes) > 2:
+            second_node_info = nodes[internal_nodes[1]].node_info
+            for ek in second_node_info.in_edges:
+                ei = edges[ek]
+                si = second_node_info.slots[ei.slot]
+                if si.is_variance_scalable:
+                    src_shape = nodes[ei.source].node_info.shape
+                    if node_config.get("flatten_input", False):
+                        import numpy as np
+                        width = int(np.prod(src_shape))
+                    else:
+                        width = src_shape[-1]
+                    break
+            else:
+                width = input_dim
+        else:
+            width = input_dim
+
+        # Compute scale per the pc-alm formula
+        if layer_ix == 0:
+            scale = 1.0 / math.sqrt(input_dim)
+        elif layer_ix == depth - 1:
+            scale = 1.0 / width
+        else:
+            scale = 1.0 / math.sqrt(width * depth)
+
+        forward_scale = {ek: scale for ek in scalable_edges}
+        topdown_grad_scale = {ek: scale for ek in scalable_edges}
+        weight_grad_scale = {ek: 1.0 for ek in scalable_edges}
+
+        scalings[node_name] = MuPCScalingFactors(
+            forward_scale=forward_scale,
+            self_grad_scale=1.0,
+            topdown_grad_scale=topdown_grad_scale,
+            weight_grad_scale=weight_grad_scale,
+        )
+
+    return scalings
 
 
 def _is_merge_node(node_info: Any) -> bool:

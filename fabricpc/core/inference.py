@@ -391,6 +391,15 @@ class InferenceALM(InferenceBase):
         rho: Penalty strength (default: 1.0). Should match the Gaussian energy
             precision. Used to compute the prediction-target shift -lambda/rho.
         latent_decay: Weight decay on latent states (default: 0.0).
+        weight_credit_timing: When to snapshot the dual variables used for
+            weight gradient computation (default: "pre_dual_energy").
+            - "pre_dual_energy": use the duals from *before* the final dual
+              update (i.e., the duals that drove the last primal step). This
+              is the default and matches the pc-alm reference's default.
+            - "post_dual_energy": perform one additional dual update after the
+              final primal step and use those updated duals for weight
+              gradients. This captures the prediction error from the final
+              primal step in the duals.
 
     Example:
         from fabricpc.core.inference import InferenceALM
@@ -408,13 +417,20 @@ class InferenceALM(InferenceBase):
         alpha=1.0,
         rho=1.0,
         latent_decay=0.0,
+        weight_credit_timing="pre_dual_energy",
     ):
+        if weight_credit_timing not in ("pre_dual_energy", "post_dual_energy"):
+            raise ValueError(
+                "weight_credit_timing must be 'pre_dual_energy' or "
+                f"'post_dual_energy', got {weight_credit_timing!r}"
+            )
         super().__init__(
             eta_infer=eta_infer,
             infer_steps=infer_steps,
             alpha=alpha,
             rho=rho,
             latent_decay=latent_decay,
+            weight_credit_timing=weight_credit_timing,
         )
 
     @staticmethod
@@ -607,6 +623,11 @@ class InferenceALM(InferenceBase):
         and are stored in each node's ``dual`` field for use by the weight
         gradient computation.
 
+        When ``weight_credit_timing="post_dual_energy"``, one additional dual
+        step is performed after the final primal step so that the prediction
+        errors from the last iteration are captured in the duals used for
+        weight gradient computation.
+
         After inference, the final state contains both the converged latents
         and the accumulated duals needed for the augmented Lagrangian weight
         gradient.
@@ -627,10 +648,18 @@ class InferenceALM(InferenceBase):
         # T-1 primal+dual cycles
         state = jax.lax.fori_loop(0, infer_steps - 1, body_fn, initial_state)
 
-        # Final primal step (no dual update after the last one)
+        # Final primal step (no dual update after the last one in pre_dual_energy)
         state = InferenceALM.inference_step(
             params, state, clamps, structure, config
         )
+
+        # If post_dual_energy, perform one more dual update so the duals
+        # used for weight gradients include the final primal step's errors.
+        weight_credit_timing = config.get(
+            "weight_credit_timing", "pre_dual_energy"
+        )
+        if weight_credit_timing == "post_dual_energy":
+            state = InferenceALM.dual_step(state, clamps, structure, config)
 
         return state
 
@@ -652,6 +681,8 @@ class InferenceALMNormClip(InferenceALM):
         max_norm: Maximum gradient norm per node (default: 1.0).
         eps: Numerical stability constant (default: 1e-8).
         latent_decay: Weight decay on latent states (default: 0.0).
+        weight_credit_timing: "pre_dual_energy" or "post_dual_energy"
+            (default: "pre_dual_energy"). See InferenceALM for details.
     """
 
     def __init__(
@@ -663,7 +694,13 @@ class InferenceALMNormClip(InferenceALM):
         max_norm=1.0,
         eps=1e-8,
         latent_decay=0.0,
+        weight_credit_timing="pre_dual_energy",
     ):
+        if weight_credit_timing not in ("pre_dual_energy", "post_dual_energy"):
+            raise ValueError(
+                "weight_credit_timing must be 'pre_dual_energy' or "
+                f"'post_dual_energy', got {weight_credit_timing!r}"
+            )
         # Build the full config dict before freezing (MappingProxyType)
         InferenceBase.__init__(
             self,
@@ -674,6 +711,7 @@ class InferenceALMNormClip(InferenceALM):
             latent_decay=latent_decay,
             max_norm=max_norm,
             eps=eps,
+            weight_credit_timing=weight_credit_timing,
         )
 
     @staticmethod

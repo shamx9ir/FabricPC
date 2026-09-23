@@ -5,7 +5,12 @@ from dataclasses import replace
 from typing import List, Dict, Optional, Tuple
 from fabricpc.core.types import GraphStructure, NodeInfo, EdgeInfo, SlotInfo
 from fabricpc.core.inference import InferenceBase
-from fabricpc.core.mupc import MuPCConfig, compute_mupc_scalings
+from fabricpc.core.mupc import (
+    MuPCConfig,
+    PCALMScaling,
+    compute_mupc_scalings,
+    compute_pcalm_scalings,
+)
 from fabricpc.core.topology import Edge
 from fabricpc.nodes.base import NodeBase
 from fabricpc.graph_initialization.state_initializer import (
@@ -215,16 +220,21 @@ def graph(
     # 5. Topological sort
     node_order = _topological_sort(finalized_nodes, edge_infos)
 
-    # 5b. Compute and attach muPC scalings if requested
+    # 5b. Compute and attach scalings if requested
     if scaling is not None:
-        if not isinstance(scaling, MuPCConfig):
-            raise TypeError(
-                f"scaling must be a MuPCConfig instance, got {type(scaling)}"
+        if isinstance(scaling, MuPCConfig):
+            mupc_scalings = compute_mupc_scalings(
+                finalized_nodes, edge_infos, scaling, node_order
             )
-
-        mupc_scalings = compute_mupc_scalings(
-            finalized_nodes, edge_infos, scaling, node_order
-        )
+        elif isinstance(scaling, PCALMScaling):
+            mupc_scalings = compute_pcalm_scalings(
+                finalized_nodes, edge_infos, scaling, node_order
+            )
+        else:
+            raise TypeError(
+                f"scaling must be a MuPCConfig or PCALMScaling instance, "
+                f"got {type(scaling)}"
+            )
 
         # Attach scaling_config to each NodeInfo via copy-on-finalize
         updated_nodes = {}
